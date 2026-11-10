@@ -16,8 +16,8 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/pkg/errors"
 
-	chainsevm "github.com/cosmos/ibc/cli/internal/chains/evm"
-	"github.com/cosmos/ibc/cli/internal/service/signer"
+	chainsevm "github.com/lfdt-ibc/ibc/cli/internal/chains/evm"
+	"github.com/lfdt-ibc/ibc/cli/internal/service/signer"
 )
 
 func estimateFees(
