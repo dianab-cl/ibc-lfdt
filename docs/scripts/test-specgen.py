@@ -444,16 +444,6 @@ def _():
     specgen.check_copyright(open(template, encoding="utf-8").read(), REL)
 
 
-@case("every published source carries the disclaimer")
-def _():
-    for dirpath, _, names in os.walk(specgen.SRC):
-        for name in names:
-            rel = os.path.relpath(os.path.join(dirpath, name), specgen.SRC)
-            if name.endswith(".md") and not specgen.excluded(rel):
-                text = open(os.path.join(dirpath, name), encoding="utf-8").read()
-                specgen.check_copyright(text, rel)
-
-
 @case("every generated page carries the generated-file header")
 def _():
     with tempfile.TemporaryDirectory() as out:

@@ -22,12 +22,6 @@ header:
       - "**/*.md"
       - "**/*.mdx"
 
-      # Images cannot carry a source header.
-      - "docs/**/*.png"
-      - "docs/**/*.jpg"
-      - "docs/**/*.gif"
-      - "docs/**/*.webp"
-
       # Files and generated formats that cannot carry a source header.
       # Full license texts: Apache-2.0 at the root, CC-BY-4.0 in docs/. The
       # Community-Spec-1.0 text is spec/01-community-specification-license-v1.md.
@@ -41,6 +35,8 @@ header:
       - "**/*.pdf"
       - "**/*.png"
       - "**/*.jpg"
+      - "**/*.gif"
+      - "**/*.webp"
       - "**/*.excalidraw"
       - "**/*.woff2"
       - "**/bun.lock"
@@ -52,6 +48,9 @@ header:
       - "cli/internal/tests/mocks/**"
       - "cli/internal/service/**/*.mock.go"
       - "gen/go/solidity-abi/*/contract.go"
+
+      # Third-party and test Solidity sources retain their own SPDX identifiers.
+      - "e2e/internal/harness/environment/solidityibc/contracts/src/**"
 
     comment: never
     license-location-threshold: 80
@@ -68,8 +67,8 @@ header:
     # The license text is copied verbatim from
     # github.com/CommunitySpecification/Community_Specification. 00 and 02 to
     # 08 are adapted here and carry the header: 00 names this repository's
-    # policies, and 05, 06 and 08 defer to the root GOVERNANCE.md,
-    # CONTRIBUTING.md and CODE_OF_CONDUCT.md.
+    # policies, 05, 06 and 08 defer to the root GOVERNANCE.md, CONTRIBUTING.md
+    # and CODE_OF_CONDUCT.md, and 07 defers to ics-template.md.
     paths-ignore:
       - "spec/01-community-specification-license-v1.md"
 
@@ -92,6 +91,10 @@ header:
       - "**/node_modules/**"
       - "spec/**"
       - "docs/ibc/spec/**"
+      # Snapshots of the ibc-go docs at past releases. They keep the license
+      # their text was written under (see CONTRIBUTING.md), so they carry no
+      # header, as in ibc-go's docs/versioned_docs/.
+      - "docs/ibc-go/v*/**"
 
     comment: never
     # Line 1, or line 2 inside YAML frontmatter, which GitHub and Mintlify

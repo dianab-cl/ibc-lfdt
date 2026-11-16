@@ -6,7 +6,7 @@ The IBC specifications are governed by the repository's [GOVERNANCE.md](../GOVER
 
 The [Community Specification License 1.0](01-community-specification-license-v1.md) relies on the governance policy for the terms below, which map onto the repository's governance as follows.
 
-- **Maintainers:** all TSC members listed in [TSC_MEMBERS.md](../TSC_MEMBERS.md), including the Chair, added and removed as [GOVERNANCE.md](../GOVERNANCE.md) describes. [TSC_MEMBERS.md](../TSC_MEMBERS.md) is the authoritative list for this purpose.
+- **Maintainers:** all TSC members listed in [TSC_MEMBERS.md](../TSC_MEMBERS.md), which is the authoritative list, including the Chair, added and removed as [GOVERNANCE.md](../GOVERNANCE.md) describes.
 - **Editors:** the Standards Committee, which is the TSC, as set out in [STANDARDS_COMMITTEE.md](STANDARDS_COMMITTEE.md). Maintainers and Editors are therefore the same people.
 - **Approval:** decisions follow the TSC's decision-making rules in [GOVERNANCE.md](../GOVERNANCE.md#decision-making): lazy consensus by default, with a TSC vote as the fallback.
 - **Appeals:** made by pull request or issue in this repository, and decided by the TSC.

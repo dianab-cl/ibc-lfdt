@@ -6,9 +6,11 @@ This file is the `Scope.md` named in section 9.13 of the [Community Specificatio
 
 The Scope of this Working Group is the Interchain Standards (ICS) listed below: specifications of the Inter-Blockchain Communication protocol (IBC), which lets independent state machines, such as blockchains, exchange authenticated and ordered data packets, with each verifying the other's state through an on-chain light client of its counterparty.
 
+Any changes of Scope are not retroactive.
+
 ## In Scope
 
-The Scope is the normative requirements stated in the text of the documents below, which are kept in this repository under `spec/`, and of later revisions to those documents. A requirement is in Scope only to the extent the text of one of these documents states it. Each entry covers every document in its directory.
+The Scope is the normative requirements stated in the text of the documents below, which are kept in this repository under `spec/`. It includes later revisions to those documents. Each entry covers every document in its directory.
 
 - **IBC v1**
   - **Core**
@@ -52,11 +54,9 @@ The Scope is the normative requirements stated in the text of the documents belo
 
 Everything not stated in the text of the documents above is out of Scope, including:
 
-- **Material incorporated by reference.** Algorithms, formats and specifications that a document references, depends on or links to but does not itself state, such as the Tendermint (CometBFT) consensus and light client algorithms ICS 7 relies on, GRANDPA, the `cosmos/ics23` proof format, the CosmWasm contract platform and the Solidity ABI encoding.
+- **Referenced material.** Algorithms, formats and specifications that a document references, depends on or links to but does not itself state, such as the Tendermint (CometBFT) consensus and light client algorithms ICS 7 relies on, GRANDPA, the `cosmos/ics23` proof format, the CosmWasm contract platform and the Solidity ABI encoding.
 - **Consensus, cryptography and execution environments.** The consensus protocols of the state machines IBC connects, cryptographic primitives such as signature schemes and hash functions, state commitment structures such as IAVL trees or Merkle Patricia tries, and virtual machines and smart contract platforms, except as the text of a document above states a requirement about them.
 - **Host and off-chain behaviour.** The internal implementation of host modules an application invokes, the effects of the messages an interchain account executes or a general message passing call makes, network transport, and the policies an operator chooses when running a relayer, except as the text of a document above states a requirement about them.
-- **Other documents in `spec/`.** The overview [`IBC_V2/README.md`](IBC_V2/README.md), the guide [`client/Rollup-Integration-guide.md`](client/Rollup-Integration-guide.md), [ICS 1](ics-001-ics-standard/README.md) and the process, contribution and template documents ([`PROCESS.md`](PROCESS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`STANDARDS_COMMITTEE.md`](STANDARDS_COMMITTEE.md), [`ics-template.md`](ics-template.md) and `00` to `08`: [`00-contributor-license-agreement.md`](00-contributor-license-agreement.md), [`01-community-specification-license-v1.md`](01-community-specification-license-v1.md), [`02-scope.md`](02-scope.md), [`03-notices.md`](03-notices.md), [`04-license.md`](04-license.md), [`05-governance.md`](05-governance.md), [`06-contributing.md`](06-contributing.md), [`07-spec-template.md`](07-spec-template.md) and [`08-code-of-conduct.md`](08-code-of-conduct.md)). They remain under the Community Specification License, but add no requirement to the Scope.
+- **Other documents in `spec/`.** The overview [`IBC_V2/README.md`](IBC_V2/README.md), the guide [`client/Rollup-Integration-guide.md`](client/Rollup-Integration-guide.md), [ICS 1](ics-001-ics-standard/README.md), the process, contribution and template documents ([`PROCESS.md`](PROCESS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`STANDARDS_COMMITTEE.md`](STANDARDS_COMMITTEE.md) and [`ics-template.md`](ics-template.md)), and the Community Specification files `00` to `08` in this directory. They add no requirement to the Scope. They are under the Community Specification License, except [`01-community-specification-license-v1.md`](01-community-specification-license-v1.md), the license text itself, which is under CC BY 4.0.
 - **New documents and standards.** A specification or document not listed above, including new Interchain Standards, new protocol versions and standards whose text is not in this repository, such as ICS 32 Interchain Queries. Adding one requires a change of Scope, approved as set out in [05-governance.md](05-governance.md).
 - **Implementations.** Source code implementing the specifications, including the software in this repository outside `spec/`.
-
-Any changes of Scope are not retroactive.

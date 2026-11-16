@@ -6,7 +6,7 @@ This file is the repository's Notices file: the `Notices.md` (or `Notice.md`) na
 
 ## Code of Conduct
 
-Contact for Code of Conduct issues or inquiries: the Code of Conduct responders listed in [TSC_MEMBERS.md](../TSC_MEMBERS.md#code-of-conduct-responders). You can contact any one of them, so a complaint never has to go to someone it concerns.
+Contact for Code of Conduct issues or inquiries: the Code of Conduct responders listed in [TSC_MEMBERS.md](../TSC_MEMBERS.md#code-of-conduct-responders). Any one of them may be contacted, so a complaint need not go to a responder it concerns.
 
 Concerns can also be escalated to LF Decentralized Trust, as described in the repository's [CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md).
 

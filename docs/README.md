@@ -8,9 +8,12 @@ generated from `spec/` at the repo root, and `ibc-go/` is imported. See
 
 Pages here are licensed under [CC BY 4.0](LICENSE), except `ibc/spec/`, which is
 generated from the specifications and stays under the
-[Community Specification License 1.0](../spec/04-license.md). Code here, such as
+[Community Specification License 1.0](../spec/01-community-specification-license-v1.md),
+and the snapshots of past ibc-go releases in `ibc-go/v*/`, which keep the license
+their text was written under (see
+[CONTRIBUTING.md](../CONTRIBUTING.md#copyright-and-license)). Code here, such as
 `scripts/` and `mintlify/scripts/`, is licensed under [Apache 2.0](../LICENSE).
-The SPDX header on each file records which applies.
+Every file except the snapshots carries an SPDX header recording which applies.
 
 ## Introduction
 
