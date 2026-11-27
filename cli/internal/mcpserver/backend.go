@@ -22,9 +22,8 @@ type ChainBackend interface {
 	TokenInfo(ctx context.Context, chainID, ift string) (TokenInfo, error)
 	IFTBalance(ctx context.Context, chainID, ift, address string) (*big.Int, error)
 
-	// IFTSend broadcasts, then waits until the tx is mined or confirmTimeout
-	// passes. It returns *ToolError with TX_REVERTED or TX_NOT_CONFIRMED
-	// (both carrying the tx) once a tx has been broadcast.
+	// IFTSend broadcasts and waits up to confirmTimeout for mining. After broadcast,
+	// failures are a *ToolError TX_REVERTED or TX_NOT_CONFIRMED carrying the tx.
 	IFTSend(ctx context.Context, req SendRequest) (TxRef, error)
 }
 
@@ -44,8 +43,7 @@ type SendRequest struct {
 	From           string // signer alias
 	Timeout        time.Duration
 	ConfirmTimeout time.Duration
-	// OnReplaced, when set, is told each time the relayer re-signs the
-	// transfer at the same nonce with higher fees, including after IFTSend
-	// returned. Only one of the hashes can be mined.
+	// OnReplaced is told of each same-nonce re-sign, even after IFTSend returned.
+	// Only one of the hashes can be mined.
 	OnReplaced func(previous, replacement string)
 }

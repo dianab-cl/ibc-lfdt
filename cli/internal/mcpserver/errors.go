@@ -8,9 +8,6 @@ import (
 	"fmt"
 )
 
-// ErrorCode is a stable, machine-readable failure class for agents to branch on.
-type ErrorCode string
-
 // Error codes returned to agents; see the API doc for when each applies.
 const (
 	CodeInvalidArgument    ErrorCode = "INVALID_ARGUMENT"
@@ -23,6 +20,9 @@ const (
 	CodeRelayerUnavailable ErrorCode = "RELAYER_UNAVAILABLE"
 	CodeRelayerError       ErrorCode = "RELAYER_ERROR"
 )
+
+// ErrorCode is a stable, machine-readable failure class for agents to branch on.
+type ErrorCode string
 
 // ToolError is returned to the agent as the JSON text of an error tool result.
 type ToolError struct {
@@ -40,18 +40,14 @@ func (e *ToolError) Error() string {
 	return string(bz)
 }
 
-func newError(code ErrorCode, format string, args ...any) *ToolError {
-	return &ToolError{Code: code, Message: fmt.Sprintf(format, args...), Retryable: retryable(code)}
-}
-
 // NewError builds a ToolError; backends use it to classify their failures.
 func NewError(code ErrorCode, format string, args ...any) *ToolError {
-	return newError(code, format, args...)
+	return &ToolError{Code: code, Message: fmt.Sprintf(format, args...), Retryable: retryable(code)}
 }
 
 // NewTxError builds a ToolError for a tx that reached the chain.
 func NewTxError(code ErrorCode, tx TxRef, format string, args ...any) *ToolError {
-	e := newError(code, format, args...)
+	e := NewError(code, format, args...)
 	e.Tx = &tx
 	return e
 }
@@ -73,5 +69,5 @@ func asToolError(err error, fallback ErrorCode) *ToolError {
 	if errors.As(err, &te) {
 		return te
 	}
-	return newError(fallback, "%s", err.Error())
+	return NewError(fallback, "%s", err.Error())
 }

@@ -31,15 +31,24 @@ import (
 	v2 "github.com/lfdt-ibc/ibc/cli/internal/types/v2"
 )
 
-// flags of `ibc relayer run` that start the MCP server beside the relayer
+// `ibc relayer run` flags for the MCP server.
 var (
 	flagRelayerMCPListen string
 )
 
-// startRelayerMCP starts the MCP server inside `ibc relayer run`, on its own
-// port, calling this relayer through api: the same handler its RelayerApiService
-// serves. --mcp-listen overrides mcp.listenAddr for this run. It returns nil
-// when both are empty.
+var _ mcpserver.ChainBackend = (*evmBackend)(nil)
+
+var rpcURLPattern = regexp.MustCompile(`https?://\S+`)
+
+// evmBackend implements mcpserver.ChainBackend. Sends use the relayer's own
+// TxSubmitter (same signer and nonces); reads dial the configured RPCs.
+type evmBackend struct {
+	cfg        config.Config
+	submitters *txsubmitter.Set
+}
+
+// startRelayerMCP starts the MCP server on its own port, calling the relayer
+// via api. --mcp-listen overrides mcp.listenAddr; neither set returns nil.
 func startRelayerMCP(
 	cfg config.Config, api relayer.RelayerApiServiceClient, submitters *txsubmitter.Set,
 ) (stop func() error, _ error) {
@@ -113,8 +122,7 @@ func startRelayerMCP(
 	}, nil
 }
 
-// mcpHomePath resolves an MCP file setting such as mcp.auditLog. An empty
-// setting uses defaultName in the IBC home. A relative path is joined to that home.
+// mcpHomePath resolves an MCP file setting against home; empty means defaultName.
 func mcpHomePath(home, configured, defaultName string) (string, error) {
 	home, err := config.ExpandHome(home)
 	if err != nil {
@@ -132,17 +140,6 @@ func mcpHomePath(home, configured, defaultName string) (string, error) {
 	}
 	return path, nil
 }
-
-// evmBackend implements mcpserver.ChainBackend over the configured EVM chains.
-// A send uses the relayer's TxSubmitter for that (chain, signer): the same
-// signer and the same nonce allocator the relayer submits with. Reads dial
-// the chain RPCs already in the relayer config.
-type evmBackend struct {
-	cfg        config.Config
-	submitters *txsubmitter.Set
-}
-
-var _ mcpserver.ChainBackend = (*evmBackend)(nil)
 
 func (b *evmBackend) Chains(context.Context) ([]mcpserver.ChainInfo, error) {
 	out := make([]mcpserver.ChainInfo, 0, len(b.cfg.Chains))
@@ -170,7 +167,9 @@ func (b *evmBackend) Signers(context.Context) ([]mcpserver.SignerInfo, error) {
 	out := make([]mcpserver.SignerInfo, 0, len(b.cfg.Signers))
 	for _, s := range b.cfg.Signers {
 		info := mcpserver.SignerInfo{Alias: s.Alias}
-		if addr, err := signer.EVMAddressOf(s); err == nil {
+		if addr, ok := b.submitterAddress(s.Alias); ok {
+			info.Address = addr
+		} else if addr, err := signer.EVMAddressOf(s); err == nil {
 			info.Address = addr
 		}
 		out = append(out, info)
@@ -179,6 +178,11 @@ func (b *evmBackend) Signers(context.Context) ([]mcpserver.SignerInfo, error) {
 }
 
 func (b *evmBackend) ResolveAddress(_ context.Context, value string) (string, error) {
+	if !common.IsHexAddress(value) {
+		if addr, ok := b.submitterAddress(value); ok {
+			return addr, nil
+		}
+	}
 	addr, err := resolveAddress(b.cfg, value)
 	if err != nil {
 		return "", mcpserver.NewError(mcpserver.CodeInvalidArgument, "%s", err.Error())
@@ -264,8 +268,17 @@ func (b *evmBackend) IFTSend(ctx context.Context, req mcpserver.SendRequest) (mc
 	return ref, nil
 }
 
-// evmSubmitter is the relayer's nonce allocator for this chain and signer.
-// There is no second key and no second pending-nonce read beside it.
+// submitterAddress is signerAlias's address from the relayer's submitter, the
+// only source for remote signers; false if no route uses it.
+func (b *evmBackend) submitterAddress(signerAlias string) (string, bool) {
+	if b.submitters == nil {
+		return "", false
+	}
+	return b.submitters.SignerAddress(signerAlias)
+}
+
+// evmSubmitter returns the relayer's own submitter so MCP sends share its
+// nonce allocator.
 func (b *evmBackend) evmSubmitter(chainID, signerAlias string) (*evmsub.TxSubmitter, error) {
 	if b.submitters == nil {
 		return nil, mcpserver.NewError(mcpserver.CodeConfigError, "relayer transaction submitters are not available")
@@ -321,11 +334,7 @@ func (b *evmBackend) dial(ctx context.Context, chainID string) (*ethclient.Clien
 	return client, nil
 }
 
-var rpcURLPattern = regexp.MustCompile(`https?://\S+`)
-
-// redactRPC drops endpoint URLs. Dial failures are already generic; call and
-// submit errors from the HTTP client include the request URL, which may hold
-// credentials.
+// redactRPC strips RPC URLs from err, as they may hold credentials.
 func redactRPC(err error) string {
 	if err == nil {
 		return ""

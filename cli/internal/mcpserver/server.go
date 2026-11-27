@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package mcpserver exposes IBC CLI operations as Model Context Protocol tools,
-// so an AI agent can send IFT transfers and follow their packets. It runs
-// inside `ibc relayer run`, on its own port, and calls that relayer directly.
-// Every write uses the signer the relayer already has on that client.
+// Package mcpserver serves IBC CLI operations as MCP tools inside `ibc relayer run`,
+// so an agent can send IFT transfers with the relayer's signers and follow their packets.
 package mcpserver
 
 import (
@@ -28,8 +26,7 @@ import (
 const (
 	serverName = "ibc"
 
-	// defaultSendTimeout is the packet lifetime (15 minutes, 900 seconds) when
-	// timeout_seconds is omitted. It is not how long the tool waits for mining.
+	// defaultSendTimeout is the packet lifetime when timeout_seconds is omitted, not the mining wait.
 	defaultSendTimeout = 15 * time.Minute
 	minSendTimeout     = time.Minute
 	maxSendTimeout     = 24 * time.Hour
@@ -62,7 +59,24 @@ const (
 	statusMined           = "mined"
 )
 
+const (
+	nextWait        = "Call ibc_wait_for_packets with this chain_id and tx_hash to follow delivery."
+	nextRelayFailed = "Call ibc_relay_tx with this chain_id and tx_hash. Do not wait first."
+	nextNever       = "Delivery will not start until you call ibc_relay_tx with this chain_id and tx_hash. Waiting is not a substitute."
+	nextAutoRelay   = "The relayer will pick the packet up. Call ibc_wait_for_packets with this chain_id and tx_hash."
+	nextNoPackets   = "The relay returned no packets. Call ibc_relay_tx again with this chain_id and tx_hash."
+	nextNotSelected = "Every packet is not_selected: this request did not queue them. Call ibc_relay_tx again with this chain_id and tx_hash."
+	nextNotQueued   = "This relayer did not queue these packets. Call ibc_relay_tx again with this chain_id and tx_hash."
+)
+
+// writeAction is the first approval field and the verb in the prompt.
+const writeAction = "Send"
+
 var txHashPattern = regexp.MustCompile(`^0x[0-9a-fA-F]{64}$`)
+
+// writeDrainTimeout bounds Close's wait, from shutdown start, for writes to log their outcome.
+// It is below httpShutdownTimeout so MCP shutdown stays within that one deadline.
+var writeDrainTimeout = 3 * time.Second
 
 // Options tune a Server; the zero value is usable.
 type Options struct {
@@ -74,9 +88,8 @@ type Options struct {
 	// Audit records MCP writes. Nil discards them; tests do that. `ibc relayer run`
 	// opens the file before the server starts.
 	Audit *AuditLog
-	// Meter counts tool calls on the relayer's existing meter. Nil skips
-	// metrics. `ibc relayer run` passes that meter; this server does not
-	// listen for scrapes.
+	// Meter counts tool calls on the relayer's meter; nil skips metrics.
+	// This server does not listen for scrapes.
 	Meter metric.Meter
 }
 
@@ -91,31 +104,130 @@ type Server struct {
 	waitDefault    time.Duration
 	waitMax        time.Duration
 	poll           time.Duration
-	// skipConfirmation skips the approval prompt. Only tests in this package
-	// set it, so no caller can build a server that sends without asking. The
-	// prompt shows the user each transfer; the bearer token, not the prompt,
-	// keeps other callers out.
+	// skipConfirmation skips the approval prompt. Unexported so only tests here
+	// can set it; the bearer token, not the prompt, keeps other callers out.
 	skipConfirmation bool
 	audit            auditSink
 	toolCalls        metric.Int64Counter
 	knownTools       map[string]struct{}
 	// replaced groups the hashes of sends the relayer re-signed.
 	replaced replacements
-	// writes counts sends and relays that have an audit intent line and have
-	// not yet written their outcome. Close waits for them before closing the
-	// audit log. writesMu guards stopping and the Add side of writes.
+	// writes and inFlight count audited writes without an outcome line yet; Close
+	// waits for them. writesMu guards stopping, inFlight and writes.Add.
 	writesMu    sync.Mutex
 	stopping    bool
 	stopStarted time.Time
 	writes      sync.WaitGroup
+	inFlight    int
 	// shutdown cancels in-flight tool calls when the server stops.
 	shutdown context.Context
 	stop     context.CancelFunc
 }
 
-// New builds a Server and registers its tools. What a caller may do is the
-// relayer's own connections: a send uses the signer configured on that client.
-// A non-nil Options.Meter counts each tool call.
+// ContextInput is the (empty) input of ibc_get_context.
+type ContextInput struct{}
+
+// WritableChain is a configured chain and whether this relayer has a connection on it.
+type WritableChain struct {
+	ChainInfo
+	Writable bool `json:"writable" jsonschema:"true when a relayer connection includes this chain"`
+}
+
+// RelayerStatus says whether the relayer answered a packet query.
+type RelayerStatus struct {
+	Ready bool   `json:"ready"`
+	Error string `json:"error,omitempty"`
+}
+
+// ContextOutput is the result of ibc_get_context.
+type ContextOutput struct {
+	Chains              []WritableChain  `json:"chains"`
+	Connections         []ConnectionInfo `json:"connections"`
+	Signers             []SignerInfo     `json:"signers"              jsonschema:"signer aliases this relayer uses on its clients"`
+	RequireConfirmation bool             `json:"require_confirmation"`
+	Relayer             RelayerStatus    `json:"relayer"`
+}
+
+// BalanceInput is the input of ibc_ift_balance.
+type BalanceInput struct {
+	ChainID string `json:"chain_id" jsonschema:"chain the IFT token is deployed on"`
+	IFT     string `json:"ift"      jsonschema:"IFT token address"`
+	Address string `json:"address"  jsonschema:"hex address or a configured signer alias"`
+}
+
+// BalanceOutput is the result of ibc_ift_balance.
+type BalanceOutput struct {
+	ChainID  string `json:"chain_id"`
+	IFT      string `json:"ift"`
+	Address  string `json:"address"`
+	Symbol   string `json:"symbol"`
+	Decimals uint8  `json:"decimals"`
+	Balance  string `json:"balance"  jsonschema:"base units"`
+}
+
+// SendInput is the input of ibc_ift_send.
+type SendInput struct {
+	ChainID        string `json:"chain_id"                  jsonschema:"source chain"`
+	IFT            string `json:"ift"                       jsonschema:"IFT token address on the source chain"`
+	ClientID       string `json:"client_id"                 jsonschema:"source client the bridge is registered for, e.g. base-0"`
+	To             string `json:"to"                        jsonschema:"receiver on the counterparty chain: hex address or signer alias"`
+	Amount         string `json:"amount"                    jsonschema:"amount in the token's base unit, decimal digits only"`
+	From           string `json:"from"                      jsonschema:"signer alias configured on this client in ibc.yml"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"packet lifetime from now (default 900 seconds), not how long the tool waits for mining"`
+	Relay          string `json:"relay,omitempty"           jsonschema:"auto (default): request relaying unless the client has autoRelay; always; never"`
+}
+
+// SendOutput is the result of ibc_ift_send.
+type SendOutput struct {
+	Tx             TxRef            `json:"tx"`
+	Status         string           `json:"status"`
+	RelayRequested bool             `json:"relay_requested"`
+	Packets        []ObservedPacket `json:"packets,omitempty"  jsonschema:"present when a relay was requested"`
+	Warnings       []string         `json:"warnings,omitempty"`
+	Next           string           `json:"next"`
+}
+
+// RelayInput is the input of ibc_relay_tx.
+type RelayInput struct {
+	ChainID string           `json:"chain_id"          jsonschema:"source chain of the tx"`
+	TxHash  string           `json:"tx_hash"           jsonschema:"source tx that emitted the packets"`
+	Packets []PacketSelector `json:"packets,omitempty" jsonschema:"packets to relay; omit for all packets in the tx"`
+}
+
+// RelayOutput is the result of ibc_relay_tx.
+type RelayOutput struct {
+	Packets  []ObservedPacket `json:"packets"            jsonschema:"every send packet in the tx and whether this relayer will deliver it"`
+	Warnings []string         `json:"warnings,omitempty"`
+	Next     string           `json:"next"               jsonschema:"what to call next. ibc_wait_for_packets only when at least one packet was selected. When every packet is unconfigured, the transfer is already mined and next names no follow-up tool. When every packet is not_selected, or no packets were returned, call ibc_relay_tx again"`
+}
+
+// PacketsInput is the input of ibc_get_packets.
+type PacketsInput struct {
+	SourceChainID       string `json:"source_chain_id,omitempty"`
+	DestinationChainID  string `json:"destination_chain_id,omitempty"`
+	SourceClientID      string `json:"source_client_id,omitempty"`
+	DestinationClientID string `json:"destination_client_id,omitempty"`
+	SourceTxHash        string `json:"source_tx_hash,omitempty"        jsonschema:"usually what you filter on"`
+	Sequence            string `json:"sequence,omitempty"              jsonschema:"packet sequence; pair it with source_client_id"`
+	State               string `json:"state,omitempty"`
+	Limit               int    `json:"limit,omitempty"                 jsonschema:"page size; default 20"`
+	Cursor              string `json:"cursor,omitempty"                jsonschema:"next_cursor from the previous page"`
+}
+
+// writeRequest is an ibc_ift_send call before authorization. ibc_ift_send is
+// the only tool that signs.
+type writeRequest struct {
+	chainID, ift, from, to, amount, clientID, relay string
+	timeout                                         time.Duration
+}
+
+// authorizedWrite is a send the relayer's client signer may make.
+type authorizedWrite struct {
+	to     string
+	amount *big.Int
+}
+
+// New builds a Server and registers its tools. Sends use the signer configured on the relayer's client.
 func New(chain ChainBackend, rel RelayerBackend, opts Options) (*Server, error) {
 	now := opts.Now
 	if now == nil {
@@ -141,9 +253,8 @@ func New(chain ChainBackend, rel RelayerBackend, opts Options) (*Server, error) 
 		audit: audit, toolCalls: toolCalls, knownTools: map[string]struct{}{},
 		shutdown: shutdown,
 	}
-	// stop is what HTTPServer.Stop and Close call. The first call starts the
-	// write drain's clock, so Close waits from the start of shutdown, not
-	// from when it is called.
+	// stop is called by HTTPServer.Stop and Close. The first call starts the
+	// write drain's clock, so Close's wait counts from the start of shutdown.
 	s.stop = func() {
 		s.writesMu.Lock()
 		if s.stopStarted.IsZero() {
@@ -167,17 +278,14 @@ func New(chain ChainBackend, rel RelayerBackend, opts Options) (*Server, error) 
 		},
 	)
 	s.register()
-	// Both sit outside the SDK's multi round-trip middleware, which New added
-	// first. For a client older than 2026-07-28 that middleware sends the
-	// approval prompt itself with the request context, so bindRequest is what
-	// ends that wait when the server stops.
+	// Outside the SDK's multi round-trip middleware, which prompts older clients
+	// with the request context, so bindRequest also ends that wait on stop.
 	s.mcp.AddReceivingMiddleware(s.observeToolCall, s.recoverPanic, s.bindRequest)
 	return s, nil
 }
 
-// recoverPanic turns a panic in a handler into an error for that call. The
-// SDK runs handlers on its own goroutines without a recover, and this server
-// shares the relayer's process, so a panic would otherwise stop relaying too.
+// recoverPanic turns a handler panic into a call error: the SDK does not recover,
+// and this server shares the relayer's process.
 func (s *Server) recoverPanic(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (res mcp.Result, err error) {
 		defer func() {
@@ -191,66 +299,13 @@ func (s *Server) recoverPanic(next mcp.MethodHandler) mcp.MethodHandler {
 	}
 }
 
-// bindRequest ends a request's context when the server stops, including the
-// SDK's own elicitation wait, which does not run inside a tool handler.
+// bindRequest ends a request's context on stop, including the SDK's elicitation wait outside handlers.
 func (s *Server) bindRequest(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 		ctx, cancel := s.bind(ctx)
 		defer cancel()
 		return next(ctx, method, req)
 	}
-}
-
-// MCP returns the underlying server, to run on a transport.
-func (s *Server) MCP() *mcp.Server { return s.mcp }
-
-// writeDrainTimeout bounds how long, from the start of shutdown, Close waits
-// for running sends and relays to write their outcome line after their
-// context was cancelled. It is below httpShutdownTimeout, so when the HTTP
-// stop already used its whole deadline Close does not wait again, and MCP
-// stays within that one deadline.
-var writeDrainTimeout = 3 * time.Second
-
-// Close cancels in-flight tool calls, waits until writeDrainTimeout after
-// shutdown began for sends and relays to record how they ended, and closes
-// the audit log. A send that was broadcast still records its hash after
-// cancellation. The relayer keeps its own state. The log lock covers a line
-// that is still syncing.
-func (s *Server) Close() error {
-	s.stop()
-	s.writesMu.Lock()
-	s.stopping = true
-	deadline := s.stopStarted.Add(writeDrainTimeout)
-	s.writesMu.Unlock()
-	drained := make(chan struct{})
-	go func() {
-		s.writes.Wait()
-		close(drained)
-	}()
-	timer := time.NewTimer(time.Until(deadline))
-	defer timer.Stop()
-	select {
-	case <-drained:
-	case <-timer.C:
-		slog.With("module", "mcp").Warn(
-			"MCP write still running at shutdown; its outcome line may be missing from the audit log")
-	}
-	if s.audit == nil {
-		return nil
-	}
-	return s.audit.Close()
-}
-
-// beginWrite registers a send or relay that is about to write an audit
-// intent line. It refuses once Close has started.
-func (s *Server) beginWrite() bool {
-	s.writesMu.Lock()
-	defer s.writesMu.Unlock()
-	if s.stopping {
-		return false
-	}
-	s.writes.Add(1)
-	return true
 }
 
 // bind returns a context that ends when ctx ends or the server stops.
@@ -261,6 +316,61 @@ func (s *Server) bind(ctx context.Context) (context.Context, context.CancelFunc)
 		stop()
 		cancel()
 	}
+}
+
+// MCP returns the underlying server, to run on a transport.
+func (s *Server) MCP() *mcp.Server { return s.mcp }
+
+// Close cancels in-flight calls, waits up to writeDrainTimeout from shutdown start
+// for sends and relays to log their outcome, then closes the audit log.
+func (s *Server) Close() error {
+	s.stop()
+	s.writesMu.Lock()
+	s.stopping = true
+	deadline := s.stopStarted.Add(writeDrainTimeout)
+	// No write can begin once stopping is set. Skip the wait when none runs:
+	// an expired timer could otherwise win select over a drained channel.
+	running := s.inFlight > 0
+	s.writesMu.Unlock()
+	if running {
+		drained := make(chan struct{})
+		go func() {
+			s.writes.Wait()
+			close(drained)
+		}()
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		select {
+		case <-drained:
+		case <-timer.C:
+			slog.With("module", "mcp").Warn(
+				"MCP write still running at shutdown; its outcome line may be missing from the audit log")
+		}
+	}
+	if s.audit == nil {
+		return nil
+	}
+	return s.audit.Close()
+}
+
+// beginWrite registers a send or relay before its audit intent line; it refuses once Close has started.
+func (s *Server) beginWrite() bool {
+	s.writesMu.Lock()
+	defer s.writesMu.Unlock()
+	if s.stopping {
+		return false
+	}
+	s.inFlight++
+	s.writes.Add(1)
+	return true
+}
+
+// endWrite finishes a write registered by beginWrite.
+func (s *Server) endWrite() {
+	s.writesMu.Lock()
+	s.inFlight--
+	s.writesMu.Unlock()
+	s.writes.Done()
 }
 
 func (s *Server) register() {
@@ -342,32 +452,6 @@ func (s *Server) register() {
 	}, s.readPacketsResource)
 }
 
-// --- ibc_get_context ---
-
-// ContextInput is the (empty) input of ibc_get_context.
-type ContextInput struct{}
-
-// WritableChain is a configured chain and whether this relayer has a connection on it.
-type WritableChain struct {
-	ChainInfo
-	Writable bool `json:"writable" jsonschema:"true when a relayer connection includes this chain"`
-}
-
-// RelayerStatus says whether the relayer answered a packet query.
-type RelayerStatus struct {
-	Ready bool   `json:"ready"`
-	Error string `json:"error,omitempty"`
-}
-
-// ContextOutput is the result of ibc_get_context.
-type ContextOutput struct {
-	Chains              []WritableChain  `json:"chains"`
-	Connections         []ConnectionInfo `json:"connections"`
-	Signers             []SignerInfo     `json:"signers"              jsonschema:"signer aliases this relayer uses on its clients"`
-	RequireConfirmation bool             `json:"require_confirmation"`
-	Relayer             RelayerStatus    `json:"relayer"`
-}
-
 func (s *Server) getContext(
 	ctx context.Context,
 	_ *mcp.CallToolRequest,
@@ -428,25 +512,6 @@ func (s *Server) getContext(
 	return nil, out, nil
 }
 
-// --- ibc_ift_balance ---
-
-// BalanceInput is the input of ibc_ift_balance.
-type BalanceInput struct {
-	ChainID string `json:"chain_id" jsonschema:"chain the IFT token is deployed on"`
-	IFT     string `json:"ift"      jsonschema:"IFT token address"`
-	Address string `json:"address"  jsonschema:"hex address or a configured signer alias"`
-}
-
-// BalanceOutput is the result of ibc_ift_balance.
-type BalanceOutput struct {
-	ChainID  string `json:"chain_id"`
-	IFT      string `json:"ift"`
-	Address  string `json:"address"`
-	Symbol   string `json:"symbol"`
-	Decimals uint8  `json:"decimals"`
-	Balance  string `json:"balance"  jsonschema:"base units"`
-}
-
 func (s *Server) iftBalance(
 	ctx context.Context,
 	_ *mcp.CallToolRequest,
@@ -476,30 +541,6 @@ func (s *Server) iftBalance(
 	}, nil
 }
 
-// --- ibc_ift_send ---
-
-// SendInput is the input of ibc_ift_send.
-type SendInput struct {
-	ChainID        string `json:"chain_id"                  jsonschema:"source chain"`
-	IFT            string `json:"ift"                       jsonschema:"IFT token address on the source chain"`
-	ClientID       string `json:"client_id"                 jsonschema:"source client the bridge is registered for, e.g. base-0"`
-	To             string `json:"to"                        jsonschema:"receiver on the counterparty chain: hex address or signer alias"`
-	Amount         string `json:"amount"                    jsonschema:"amount in the token's base unit, decimal digits only"`
-	From           string `json:"from"                      jsonschema:"signer alias configured on this client in ibc.yml"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"packet lifetime from now (default 900 seconds), not how long the tool waits for mining"`
-	Relay          string `json:"relay,omitempty"           jsonschema:"auto (default): request relaying unless the client has autoRelay; always; never"`
-}
-
-// SendOutput is the result of ibc_ift_send.
-type SendOutput struct {
-	Tx             TxRef            `json:"tx"`
-	Status         string           `json:"status"`
-	RelayRequested bool             `json:"relay_requested"`
-	Packets        []ObservedPacket `json:"packets,omitempty"  jsonschema:"present when a relay was requested"`
-	Warnings       []string         `json:"warnings,omitempty"`
-	Next           string           `json:"next"`
-}
-
 func (s *Server) iftSend(
 	ctx context.Context,
 	req *mcp.CallToolRequest,
@@ -519,12 +560,12 @@ func (s *Server) iftSend(
 
 	switch {
 	case in.ClientID == "":
-		return s.rejectSend(in, relayMode, newError(CodeInvalidArgument, "client_id is required"))
+		return s.rejectSend(in, relayMode, NewError(CodeInvalidArgument, "client_id is required"))
 	case timeout < minSendTimeout || timeout > maxSendTimeout:
-		return s.rejectSend(in, relayMode, newError(CodeInvalidArgument, "timeout_seconds must be between %d and %d",
+		return s.rejectSend(in, relayMode, NewError(CodeInvalidArgument, "timeout_seconds must be between %d and %d",
 			int(minSendTimeout.Seconds()), int(maxSendTimeout.Seconds())))
 	case relayMode != relayAuto && relayMode != relayAlways && relayMode != relayNever:
-		return s.rejectSend(in, relayMode, newError(CodeInvalidArgument, "relay must be auto, always or never"))
+		return s.rejectSend(in, relayMode, NewError(CodeInvalidArgument, "relay must be auto, always or never"))
 	}
 
 	w, ask, err := s.authorizeWrite(ctx, req, writeRequest{
@@ -539,9 +580,9 @@ func (s *Server) iftSend(
 	}
 
 	if !s.beginWrite() {
-		return s.rejectSend(in, relayMode, newError(CodeRelayerUnavailable, "the MCP server is stopping"))
+		return s.rejectSend(in, relayMode, NewError(CodeRelayerUnavailable, "the MCP server is stopping"))
 	}
-	defer s.writes.Done()
+	defer s.endWrite()
 	rec, err := s.beginAudit(auditRecord{
 		Tool: "ibc_ift_send", ChainID: in.ChainID, IFT: in.IFT, From: in.From, To: w.to,
 		Amount: w.amount.String(), ClientID: in.ClientID, Relay: relayMode,
@@ -557,9 +598,8 @@ func (s *Server) iftSend(
 			s.noteReplaced(rec, req, in.ChainID, previous, replacement)
 		},
 	})
-	// The approval was spent before this call. Keep the hash, once broadcast
-	// has returned one, so a later retry of the same approval can show it.
-	// A hash that broadcast has not returned is not invented.
+	// The approval is already spent. Keep a returned hash so a retry of the
+	// same approval can show it; never invent one.
 	if ref, ok := observedBroadcast(tx, err); ok {
 		s.noteBroadcast(req, ref)
 	}
@@ -578,13 +618,8 @@ func (s *Server) iftSend(
 		packets, err := s.relayer.Relay(ctx, tx.ChainID, tx.TxHash, nil)
 		if err != nil {
 			relayFailed = true
-			out.Warnings = append(
-				out.Warnings,
-				"tx is mined but the relay request failed; retry with ibc_relay_tx: "+asToolError(
-					err,
-					CodeRelayerError,
-				).Message,
-			)
+			out.Warnings = append(out.Warnings, "tx is mined but the relay request failed; retry with ibc_relay_tx: "+
+				asToolError(err, CodeRelayerError).Message)
 		} else {
 			out.RelayRequested = true
 			out.Packets = packets
@@ -592,9 +627,7 @@ func (s *Server) iftSend(
 				if p.Selection == SelectionUnconfigured {
 					out.Warnings = append(out.Warnings, fmt.Sprintf(
 						"packet %s/%s has no route on this relayer and will not be delivered by it",
-						p.SourceClientID,
-						p.Sequence,
-					))
+						p.SourceClientID, p.Sequence))
 				}
 			}
 		}
@@ -608,7 +641,7 @@ func (s *Server) iftSend(
 	return nil, out, nil
 }
 
-// rejectSend records a send that was refused before anything was submitted.
+// rejectSend audits a send refused before submission.
 func (s *Server) rejectSend(in SendInput, relay string, err error) (*mcp.CallToolResult, SendOutput, error) {
 	s.note(auditRecord{
 		Tool: "ibc_ift_send", ChainID: in.ChainID, IFT: in.IFT, From: in.From, To: in.To,
@@ -617,9 +650,7 @@ func (s *Server) rejectSend(in SendInput, relay string, err error) (*mcp.CallToo
 	return nil, SendOutput{}, err
 }
 
-// planRelay applies the relay mode. auto requests relaying unless the source
-// client end has autoRelay enabled, in which case skippedForAutoRelay is true
-// and this server does not send a relay request. never does not request a relay.
+// planRelay applies the relay mode; auto skips the request when the source client end has autoRelay.
 func (s *Server) planRelay(ctx context.Context, mode, chainID, clientID string) (request, skippedForAutoRelay bool) {
 	switch mode {
 	case relayNever:
@@ -627,42 +658,34 @@ func (s *Server) planRelay(ctx context.Context, mode, chainID, clientID string) 
 	case relayAlways:
 		return true, false
 	}
-	ends, err := s.connectionEnds(ctx)
-	if err != nil {
+	end, found, err := s.clientEnd(ctx, chainID, clientID)
+	if err != nil || !found {
 		return true, false
 	}
-	for _, end := range ends {
-		if end.ChainID == chainID && end.ClientID == clientID {
-			return !end.AutoRelay, end.AutoRelay
-		}
-	}
-	return true, false
+	return !end.AutoRelay, end.AutoRelay
 }
 
-const (
-	nextWait        = "Call ibc_wait_for_packets with this chain_id and tx_hash to follow delivery."
-	nextRelayFailed = "Call ibc_relay_tx with this chain_id and tx_hash. Do not wait first."
-	nextNever       = "Delivery will not start until you call ibc_relay_tx with this chain_id and tx_hash. Waiting is not a substitute."
-	nextAutoRelay   = "The relayer will pick the packet up. Call ibc_wait_for_packets with this chain_id and tx_hash."
-	nextNoPackets   = "The relay returned no packets. Call ibc_relay_tx again with this chain_id and tx_hash."
-	nextNotSelected = "Every packet is not_selected: this request did not queue them. Call ibc_relay_tx again with this chain_id and tx_hash."
-	nextNotQueued   = "This relayer did not queue these packets. Call ibc_relay_tx again with this chain_id and tx_hash."
-)
-
-// sendNext tells the agent the next tool call for this mined transfer.
-// When every observed packet is unconfigured, the transfer is already mined,
-// this relayer has no route, and the text names no follow-up tool.
-// An unconfigured packet among others, and a relay failure, both stay in the
-// text. A relay failure is not a reason to wait first. Waiting is only a next
-// step when at least one packet was selected. not_selected means this request
-// did not queue the packet, and an empty relay result queued nothing.
+// sendNext is the agent's next step after a mined transfer. It suggests waiting only when a packet
+// was selected, and names no follow-up tool when every packet is unconfigured.
 func sendNext(mode string, requested, failed, skippedForAutoRelay bool, packets []ObservedPacket) string {
-	if allUnconfigured(packets) {
-		return allUnconfiguredNext(packets)
+	var unconfigured []string
+	selected, notSelected := false, 0
+	for _, p := range packets {
+		switch p.Selection {
+		case SelectionUnconfigured:
+			unconfigured = append(unconfigured, p.SourceClientID+"/"+p.Sequence)
+		case SelectionSelected:
+			selected = true
+		case SelectionNotSelected:
+			notSelected++
+		}
+	}
+	if len(packets) > 0 && len(unconfigured) == len(packets) {
+		return "The source transfer is already mined. Do not call ibc_ift_send again. " + unconfiguredNext(unconfigured)
 	}
 	var parts []string
-	if msg := unconfiguredNext(packets); msg != "" {
-		parts = append(parts, msg)
+	if len(unconfigured) > 0 {
+		parts = append(parts, unconfiguredNext(unconfigured))
 	}
 	if failed {
 		parts = append(parts, nextRelayFailed)
@@ -670,53 +693,25 @@ func sendNext(mode string, requested, failed, skippedForAutoRelay bool, packets 
 	switch {
 	case mode == relayNever:
 		parts = append(parts, nextNever)
-	case !failed && skippedForAutoRelay:
+	case failed:
+	case skippedForAutoRelay:
 		parts = append(parts, nextAutoRelay)
-	case requested && !failed && packetsSelected(packets):
+	case !requested:
+	case selected:
 		parts = append(parts, nextWait)
-	case requested && !failed && len(unconfiguredPacketIDs(packets)) == 0:
-		parts = append(parts, relayAgainNext(packets))
+	case len(unconfigured) > 0:
+	case len(packets) == 0:
+		parts = append(parts, nextNoPackets)
+	case notSelected == len(packets):
+		parts = append(parts, nextNotSelected)
+	default:
+		parts = append(parts, nextNotQueued)
 	}
 	return strings.Join(parts, " ")
 }
 
-// relayAgainNext is the next step when a relay ran and queued nothing.
-// not_selected and an empty packet list both mean another ibc_relay_tx, not a wait.
-func relayAgainNext(packets []ObservedPacket) string {
-	if len(packets) == 0 {
-		return nextNoPackets
-	}
-	for _, p := range packets {
-		if p.Selection != SelectionNotSelected {
-			return nextNotQueued
-		}
-	}
-	return nextNotSelected
-}
-
-func allUnconfigured(packets []ObservedPacket) bool {
-	if len(packets) == 0 {
-		return false
-	}
-	for _, p := range packets {
-		if p.Selection != SelectionUnconfigured {
-			return false
-		}
-	}
-	return true
-}
-
-// allUnconfiguredNext is the next step when this relayer has no route for any
-// observed packet. It names no tool to call.
-func allUnconfiguredNext(packets []ObservedPacket) string {
-	return "The source transfer is already mined. Do not call ibc_ift_send again. " + unconfiguredNext(packets)
-}
-
-func unconfiguredNext(packets []ObservedPacket) string {
-	ids := unconfiguredPacketIDs(packets)
-	if len(ids) == 0 {
-		return ""
-	}
+// unconfiguredNext warns that this relayer will not deliver packets ids.
+func unconfiguredNext(ids []string) string {
 	if len(ids) == 1 {
 		return fmt.Sprintf(
 			"This relayer will not deliver packet %s; it has no route on this relayer. Do not wait for this relayer to deliver it.",
@@ -727,41 +722,6 @@ func unconfiguredNext(packets []ObservedPacket) string {
 		"This relayer will not deliver packets %s; it has no route for them on this relayer. Do not wait for this relayer to deliver them.",
 		strings.Join(ids, ", "),
 	)
-}
-
-func unconfiguredPacketIDs(packets []ObservedPacket) []string {
-	ids := make([]string, 0, len(packets))
-	for _, p := range packets {
-		if p.Selection == SelectionUnconfigured {
-			ids = append(ids, p.SourceClientID+"/"+p.Sequence)
-		}
-	}
-	return ids
-}
-
-func packetsSelected(packets []ObservedPacket) bool {
-	for _, p := range packets {
-		if p.Selection == SelectionSelected {
-			return true
-		}
-	}
-	return false
-}
-
-// --- ibc_relay_tx ---
-
-// RelayInput is the input of ibc_relay_tx.
-type RelayInput struct {
-	ChainID string           `json:"chain_id"          jsonschema:"source chain of the tx"`
-	TxHash  string           `json:"tx_hash"           jsonschema:"source tx that emitted the packets"`
-	Packets []PacketSelector `json:"packets,omitempty" jsonschema:"packets to relay; omit for all packets in the tx"`
-}
-
-// RelayOutput is the result of ibc_relay_tx.
-type RelayOutput struct {
-	Packets  []ObservedPacket `json:"packets"            jsonschema:"every send packet in the tx and whether this relayer will deliver it"`
-	Warnings []string         `json:"warnings,omitempty"`
-	Next     string           `json:"next"               jsonschema:"what to call next. ibc_wait_for_packets only when at least one packet was selected. When every packet is unconfigured, the transfer is already mined and next names no follow-up tool. When every packet is not_selected, or no packets were returned, call ibc_relay_tx again"`
 }
 
 func (s *Server) relayTx(
@@ -775,18 +735,18 @@ func (s *Server) relayTx(
 	if err := requireTxHash(in.TxHash); err != nil {
 		return s.rejectRelay(in, err)
 	}
-	ok, err := s.relaysChain(ctx, in.ChainID)
+	_, ok, err := s.clientEnd(ctx, in.ChainID, "")
 	if err != nil {
 		return s.rejectRelay(in, asToolError(err, CodeConfigError))
 	}
 	if !ok {
-		return s.rejectRelay(in, newError(CodePolicyDenied, "chain %q has no connection on this relayer", in.ChainID))
+		return s.rejectRelay(in, NewError(CodePolicyDenied, "chain %q has no connection on this relayer", in.ChainID))
 	}
 
 	if !s.beginWrite() {
-		return s.rejectRelay(in, newError(CodeRelayerUnavailable, "the MCP server is stopping"))
+		return s.rejectRelay(in, NewError(CodeRelayerUnavailable, "the MCP server is stopping"))
 	}
-	defer s.writes.Done()
+	defer s.endWrite()
 	rec, err := s.beginAudit(auditRecord{
 		Tool: "ibc_relay_tx", ChainID: in.ChainID, TxHash: in.TxHash,
 	})
@@ -813,9 +773,8 @@ func (s *Server) relayTx(
 	return nil, out, nil
 }
 
-// relayFamily asks the relayer to deliver in.TxHash, or the hash of the same
-// transfer that was mined when the relayer re-signed it. It returns the hash
-// it relayed. Without replacements it is one Relay call.
+// relayFamily relays in.TxHash, or the mined hash of the same transfer if the relayer
+// re-signed it, and returns the hash relayed.
 func (s *Server) relayFamily(ctx context.Context, in RelayInput) ([]ObservedPacket, string, error) {
 	hashes := s.replaced.family(in.TxHash)
 	if len(hashes) == 1 {
@@ -839,31 +798,15 @@ func (s *Server) relayFamily(ctx context.Context, in RelayInput) ([]ObservedPack
 	return askedPackets, in.TxHash, askedErr
 }
 
-// relayNext is the next step after a relay that returned. It waits only when
-// at least one packet was selected.
+// relayNext is the next step after a relay that returned.
 func relayNext(packets []ObservedPacket) string {
 	return sendNext(relayAlways, true, false, false, packets)
 }
 
-// rejectRelay records a relay that was refused before the relayer was asked.
+// rejectRelay audits a relay refused before the relayer was asked.
 func (s *Server) rejectRelay(in RelayInput, err error) (*mcp.CallToolResult, RelayOutput, error) {
 	s.note(auditRecord{Tool: "ibc_relay_tx", ChainID: in.ChainID, TxHash: in.TxHash}, err)
 	return nil, RelayOutput{}, err
-}
-
-// --- ibc_get_packets ---
-
-// PacketsInput is the input of ibc_get_packets.
-type PacketsInput struct {
-	SourceChainID       string `json:"source_chain_id,omitempty"`
-	DestinationChainID  string `json:"destination_chain_id,omitempty"`
-	SourceClientID      string `json:"source_client_id,omitempty"`
-	DestinationClientID string `json:"destination_client_id,omitempty"`
-	SourceTxHash        string `json:"source_tx_hash,omitempty"        jsonschema:"usually what you filter on"`
-	Sequence            string `json:"sequence,omitempty"              jsonschema:"packet sequence; pair it with source_client_id"`
-	State               string `json:"state,omitempty"`
-	Limit               int    `json:"limit,omitempty"                 jsonschema:"page size; default 20"`
-	Cursor              string `json:"cursor,omitempty"                jsonschema:"next_cursor from the previous page"`
 }
 
 func (s *Server) getPackets(
@@ -882,7 +825,7 @@ func (s *Server) getPackets(
 	if in.Sequence != "" {
 		seq, ok := parseAmount(in.Sequence)
 		if !ok || !seq.IsUint64() {
-			return nil, PacketsPage{}, newError(CodeInvalidArgument, "invalid sequence %q", in.Sequence)
+			return nil, PacketsPage{}, NewError(CodeInvalidArgument, "invalid sequence %q", in.Sequence)
 		}
 		v := seq.Uint64()
 		filter.Sequence = &v
@@ -892,7 +835,7 @@ func (s *Server) getPackets(
 		limit = defaultPacketsLimit
 	}
 	if limit < 1 || limit > maxPacketsLimit {
-		return nil, PacketsPage{}, newError(CodeInvalidArgument, "limit must be between 1 and %d", maxPacketsLimit)
+		return nil, PacketsPage{}, NewError(CodeInvalidArgument, "limit must be between 1 and %d", maxPacketsLimit)
 	}
 
 	page, err := s.relayer.Packets(ctx, filter, uint32(limit), in.Cursor)
@@ -922,8 +865,6 @@ func (s *Server) getPackets(
 	return nil, page, nil
 }
 
-// --- resource ---
-
 func (s *Server) readPacketsResource(
 	ctx context.Context,
 	req *mcp.ReadResourceRequest,
@@ -950,32 +891,8 @@ func (s *Server) readPacketsResource(
 	}, nil
 }
 
-// --- write authorization ---
-
-// writeRequest is an ibc_ift_send call before authorization. ibc_ift_send is
-// the only tool that signs.
-type writeRequest struct {
-	chainID, ift, from, to, amount, clientID, relay string
-	timeout                                         time.Duration
-}
-
-// writeAction is the first approval field and the verb in the prompt.
-const writeAction = "Send"
-
-// authorizedWrite is a send the relayer's client signer may make.
-type authorizedWrite struct {
-	to     string
-	amount *big.Int
-}
-
-// authorizeWrite checks the send against this relayer's connections, then asks
-// the user to confirm.
-//
-// Confirmation uses MCP multi round-trip requests: the first call returns
-// ask, an input-required result carrying an elicitation, and the client
-// retries with the user's answer. The SDK turns this into a plain
-// elicitation/create for clients on older protocol versions. The connection
-// check runs again on the retry.
+// authorizeWrite checks the send against this relayer's connections, then returns ask to get
+// user approval via a multi round-trip request; the checks rerun on the client's retry.
 func (s *Server) authorizeWrite(
 	ctx context.Context, req *mcp.CallToolRequest, w writeRequest,
 ) (_ authorizedWrite, ask *mcp.CallToolResult, _ error) {
@@ -986,22 +903,19 @@ func (s *Server) authorizeWrite(
 	// ABI packing reduces a uint256 modulo 2^256, so a larger amount would be
 	// approved and audited as one number and sent as another.
 	if !ok || amount.Sign() == 0 || amount.BitLen() > 256 {
-		return authorizedWrite{}, nil, newError(
-			CodeInvalidArgument,
-			"amount %q must be a positive integer in base units, at most 2^256-1",
-			w.amount,
-		)
+		return authorizedWrite{}, nil, NewError(CodeInvalidArgument,
+			"amount %q must be a positive integer in base units, at most 2^256-1", w.amount)
 	}
 	end, found, err := s.clientEnd(ctx, w.chainID, w.clientID)
 	if err != nil {
 		return authorizedWrite{}, nil, asToolError(err, CodeConfigError)
 	}
 	if !found {
-		return authorizedWrite{}, nil, newError(
+		return authorizedWrite{}, nil, NewError(
 			CodePolicyDenied, "client %q on chain %q is not on this relayer", w.clientID, w.chainID)
 	}
 	if w.from != end.Signer {
-		return authorizedWrite{}, nil, newError(
+		return authorizedWrite{}, nil, NewError(
 			CodePolicyDenied, "signer %q is not configured on client %q", w.from, w.clientID)
 	}
 
@@ -1012,15 +926,8 @@ func (s *Server) authorizeWrite(
 
 	if !s.skipConfirmation {
 		fields := []string{
-			writeAction,
-			w.chainID,
-			strings.ToLower(w.ift),
-			w.from,
-			strings.ToLower(to),
-			amount.String(),
-			w.clientID,
-			w.timeout.String(),
-			w.relay,
+			writeAction, w.chainID, strings.ToLower(w.ift), w.from, strings.ToLower(to),
+			amount.String(), w.clientID, w.timeout.String(), w.relay,
 		}
 		if len(req.Params.InputResponses) == 0 {
 			ask, askErr := s.askConfirmation(ctx, req, w, to, amount, fields)
@@ -1034,54 +941,29 @@ func (s *Server) authorizeWrite(
 	return authorizedWrite{to: to, amount: amount}, nil, nil
 }
 
+// clientEnd finds the connection end for clientID on chainID; an empty clientID matches any.
 func (s *Server) clientEnd(ctx context.Context, chainID, clientID string) (ClientEndInfo, bool, error) {
-	ends, err := s.connectionEnds(ctx)
+	conns, err := s.chain.Connections(ctx)
 	if err != nil {
 		return ClientEndInfo{}, false, err
 	}
-	for _, end := range ends {
-		if end.ChainID == chainID && end.ClientID == clientID {
-			return end, true, nil
+	for _, c := range conns {
+		for _, end := range []ClientEndInfo{c.ClientA, c.ClientB} {
+			if end.ChainID == chainID && (clientID == "" || end.ClientID == clientID) {
+				return end, true, nil
+			}
 		}
 	}
 	return ClientEndInfo{}, false, nil
 }
 
-func (s *Server) relaysChain(ctx context.Context, chainID string) (bool, error) {
-	ends, err := s.connectionEnds(ctx)
-	if err != nil {
-		return false, err
-	}
-	for _, end := range ends {
-		if end.ChainID == chainID {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// connectionEnds lists both sides of every relayer connection.
-func (s *Server) connectionEnds(ctx context.Context) ([]ClientEndInfo, error) {
-	conns, err := s.chain.Connections(ctx)
-	if err != nil {
-		return nil, err
-	}
-	ends := make([]ClientEndInfo, 0, len(conns)*2)
-	for _, c := range conns {
-		ends = append(ends, c.ClientA, c.ClientB)
-	}
-	return ends, nil
-}
-
-// askConfirmation builds the input-required result that asks the user to
-// approve. A client that cannot be asked is refused, rather than writing
-// unconfirmed.
+// askConfirmation builds the approval request; a client without elicitation is refused, not sent unconfirmed.
 func (s *Server) askConfirmation(
 	ctx context.Context, req *mcp.CallToolRequest, w writeRequest, to string, amount *big.Int, fields []string,
 ) (*mcp.CallToolResult, error) {
 	caps := req.ClientCapabilities()
 	if caps == nil || caps.Elicitation == nil {
-		return nil, newError(CodePolicyDenied,
+		return nil, NewError(CodePolicyDenied,
 			"user confirmation is required but this MCP client does not support elicitation")
 	}
 
@@ -1092,16 +974,7 @@ func (s *Server) askConfirmation(
 	msg := fmt.Sprintf(
 		"%s %s of token %s on chain %s from signer %q to %s, over client %s with a %s packet timeout, "+
 			"relay %s. Approve this transaction?",
-		writeAction,
-		shown,
-		w.ift,
-		w.chainID,
-		w.from,
-		to,
-		w.clientID,
-		w.timeout,
-		w.relay,
-	)
+		writeAction, shown, w.ift, w.chainID, w.from, to, w.clientID, w.timeout, w.relay)
 
 	return &mcp.CallToolResult{
 		InputRequests: mcp.InputRequestMap{
@@ -1124,61 +997,54 @@ func (s *Server) askConfirmation(
 	}, nil
 }
 
-// checkConfirmation verifies the retry carries the user's approval for
-// exactly this write.
+// checkConfirmation verifies the retry carries the user's approval for exactly this write.
 func (s *Server) checkConfirmation(req *mcp.CallToolRequest, fields []string) error {
-	status := s.confirm.redeem(req.Params.RequestState, fields...)
-	if status == confirmUsed {
+	switch s.confirm.redeem(req.Params.RequestState, fields...) {
+	case confirmAccepted:
+	case confirmUsed:
 		return spentApprovalError(s.confirm.spentTx(req.Params.RequestState))
-	}
-	if status == confirmOtherRun {
-		return newError(CodePolicyDenied,
+	case confirmOtherRun:
+		return NewError(CodePolicyDenied,
 			"confirmation was issued before this relayer restarted, so whether it was used is not known; "+
 				"the transfer may already be broadcast. Ask the user before calling ibc_ift_send again.")
-	}
-	if status == confirmStale {
-		return newError(CodePolicyDenied,
+	case confirmStale:
+		return NewError(CodePolicyDenied,
 			"confirmation expired more than %s ago and this server no longer knows whether it was used; "+
 				"the transfer may already be broadcast. Ask the user before calling ibc_ift_send again.",
 			spentRetention)
-	}
-	if status != confirmAccepted {
+	default:
 		// Mismatch and expiry did not spend the token.
-		return newError(CodePolicyDenied,
+		return NewError(CodePolicyDenied,
 			"confirmation does not match this transaction or has expired; call the tool again")
 	}
 	res, ok := req.Params.InputResponses[confirmInputKey].(*mcp.ElicitResult)
 	if !ok || res == nil {
-		return newError(CodeUserDeclined, "no confirmation answer was returned")
+		return NewError(CodeUserDeclined, "no confirmation answer was returned")
 	}
 	if res.Action != "accept" {
-		return newError(CodeUserDeclined, "user did not approve the transaction (%s)", res.Action)
+		return NewError(CodeUserDeclined, "user did not approve the transaction (%s)", res.Action)
 	}
 	if approve, _ := res.Content["approve"].(bool); !approve {
-		return newError(CodeUserDeclined, "user did not approve the transaction")
+		return NewError(CodeUserDeclined, "user did not approve the transaction")
 	}
 	return nil
 }
 
-// --- helpers ---
-
-// spentApprovalError is the result of replaying an approval that was already
-// redeemed. The approval is spent before broadcast, so a hash exists here only
-// when that broadcast has since returned one.
+// spentApprovalError reports a replayed approval. Approvals are spent before broadcast,
+// so a hash is present only if that broadcast has since returned one.
 func spentApprovalError(tx *TxRef) *ToolError {
 	if tx == nil || tx.TxHash == "" {
-		return newError(CodePolicyDenied,
+		return NewError(CodePolicyDenied,
 			"confirmation was already used; the transfer may already be broadcast. No transaction hash was returned. Ask the user. Do not call ibc_ift_send.")
 	}
-	e := newError(CodePolicyDenied,
+	e := NewError(CodePolicyDenied,
 		"confirmation was already used; the transfer may already be broadcast. Call ibc_get_packets with source_tx_hash. Do not call ibc_ift_send.")
 	copied := *tx
 	e.Tx = &copied
 	return e
 }
 
-// observedBroadcast is the tx hash broadcast returned. The value result is
-// empty when IFTSend fails, and the hash then sits on the tool error.
+// observedBroadcast returns the broadcast tx hash, taken from the tool error when IFTSend failed.
 func observedBroadcast(tx TxRef, err error) (TxRef, bool) {
 	if tx.TxHash != "" {
 		return tx, true
@@ -1200,14 +1066,14 @@ func (s *Server) noteBroadcast(req *mcp.CallToolRequest, tx TxRef) {
 
 func requireIFT(addr string) error {
 	if !common.IsHexAddress(addr) {
-		return newError(CodeInvalidArgument, "ift %q is not a hex address", addr)
+		return NewError(CodeInvalidArgument, "ift %q is not a hex address", addr)
 	}
 	return nil
 }
 
 func requireTxHash(h string) error {
 	if !txHashPattern.MatchString(h) {
-		return newError(CodeInvalidArgument, "tx_hash %q must be 0x followed by 64 hex characters", h)
+		return NewError(CodeInvalidArgument, "tx_hash %q must be 0x followed by 64 hex characters", h)
 	}
 	return nil
 }

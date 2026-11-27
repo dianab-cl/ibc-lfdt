@@ -2,15 +2,6 @@
 
 package mcpserver
 
-// TxRef identifies a transaction on a chain.
-type TxRef struct {
-	ChainID string `json:"chain_id" jsonschema:"EVM chain ID"`
-	TxHash  string `json:"tx_hash"  jsonschema:"transaction hash, 0x-prefixed"`
-}
-
-// PacketState is the relay state of a packet, as reported by the relayer.
-type PacketState string
-
 // Packet states, mirroring the relayer's PacketState enum.
 const (
 	StateUnspecified PacketState = "unspecified"
@@ -22,20 +13,27 @@ const (
 	StateRelayFailed PacketState = "relay_failed"
 )
 
-// Final reports whether no further state change is expected.
-func (s PacketState) Final() bool {
-	switch s {
-	case StateSucceeded, StateTimedOut, StateRejected, StateRelayFailed:
-		return true
-	default:
-		return false
-	}
-}
+// Packet selections, mirroring the relayer's PacketSelection enum.
+const (
+	SelectionUnspecified  PacketSelection = "unspecified"
+	SelectionSelected     PacketSelection = "selected"
+	SelectionNotSelected  PacketSelection = "not_selected"
+	SelectionUnconfigured PacketSelection = "unconfigured"
+)
 
 // PacketStates lists every state accepted as a filter, in lifecycle order.
 var PacketStates = []PacketState{
 	StateNotSelected, StatePending, StateSucceeded, StateTimedOut, StateRejected, StateRelayFailed,
 }
+
+// TxRef identifies a transaction on a chain.
+type TxRef struct {
+	ChainID string `json:"chain_id" jsonschema:"EVM chain ID"`
+	TxHash  string `json:"tx_hash"  jsonschema:"transaction hash, 0x-prefixed"`
+}
+
+// PacketState is the relay state of a packet, as reported by the relayer.
+type PacketState string
 
 // PacketStatus is one packet and the transactions that moved it.
 // A packet is identified by send_tx.chain_id, source_client_id and sequence.
@@ -52,14 +50,6 @@ type PacketStatus struct {
 
 // PacketSelection says whether a relayer will deliver a packet it was asked about.
 type PacketSelection string
-
-// Packet selections, mirroring the relayer's PacketSelection enum.
-const (
-	SelectionUnspecified  PacketSelection = "unspecified"
-	SelectionSelected     PacketSelection = "selected"
-	SelectionNotSelected  PacketSelection = "not_selected"
-	SelectionUnconfigured PacketSelection = "unconfigured"
-)
 
 // ObservedPacket is a send packet found in a transaction by Relay.
 type ObservedPacket struct {
@@ -123,4 +113,14 @@ type SignerInfo struct {
 type TokenInfo struct {
 	Symbol   string `json:"symbol"`
 	Decimals uint8  `json:"decimals"`
+}
+
+// Final reports whether no further state change is expected.
+func (s PacketState) Final() bool {
+	switch s {
+	case StateSucceeded, StateTimedOut, StateRejected, StateRelayFailed:
+		return true
+	default:
+		return false
+	}
 }

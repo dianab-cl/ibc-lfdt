@@ -20,16 +20,11 @@ import (
 // TokenFileName is the bearer token file in the IBC home when mcp.tokenFile is empty.
 const TokenFileName = "mcp-token"
 
-// minTokenLength rejects a token file an operator filled with something guessable.
-// A generated token is 64 hex characters.
+// minTokenLength rejects guessable operator tokens; generated ones are 64 hex characters.
 const minTokenLength = 32
 
-// LoadOrCreateToken returns the bearer token MCP clients must send. It reads
-// path, or creates it with a random token and mode 0600 when it does not exist.
-// An existing file that group or others can access is set to 0600 first.
-// Any process that can reach the loopback port can call the tools, and the
-// elicitation that approves a send is answered by that same caller, so the
-// token is what keeps other local users and processes out.
+// LoadOrCreateToken reads or creates the 0600 bearer token file at path. The token
+// is what keeps other local processes out, since the caller also answers approvals.
 func LoadOrCreateToken(path string) (string, error) {
 	if f, err := os.Open(path); err == nil {
 		defer f.Close()
@@ -74,8 +69,7 @@ func LoadOrCreateToken(path string) (string, error) {
 	return token, nil
 }
 
-// requireBearer rejects a request whose Authorization header is not
-// "Bearer <token>" with 401, before the MCP handler sees it.
+// requireBearer answers 401 unless the request carries "Bearer <token>".
 func requireBearer(token string, next http.Handler) http.Handler {
 	want := []byte(token)
 	verify := func(_ context.Context, got string, _ *http.Request) (*auth.TokenInfo, error) {

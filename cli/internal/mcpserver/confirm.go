@@ -16,30 +16,34 @@ import (
 const (
 	confirmInputKey = "confirm"
 	confirmStateTTL = 10 * time.Minute
-	// spentRetention is how long a spent approval is remembered after its
-	// token expires. Until then a replay is reported as already used, not as
-	// expired, so the agent is not told to send again after a broadcast.
+	// spentRetention keeps a spent approval past expiry so a replay reports used,
+	// not expired, and the agent is not told to send again.
 	spentRetention = 24 * time.Hour
 )
 
-// confirmations issues and checks the RequestState that ties a user's
-// approval to one exact write. A tool call that needs approval returns an
-// elicitation input request plus a state token; the client retries with the
-// user's answer and echoes the token. The token is an HMAC over a nonce and
-// the write's resolved fields, so approving one transfer cannot authorize a
-// different one, and each nonce is accepted once.
+const (
+	confirmAccepted confirmStatus = iota
+	confirmMismatch
+	// confirmExpired is a token that expired unspent.
+	confirmExpired
+	confirmUsed
+	// confirmStale expired over spentRetention ago, so whether it was spent is unknown.
+	confirmStale
+	// confirmOtherRun was issued before a restart, so whether it was spent is unknown.
+	confirmOtherRun
+)
+
+// confirmations ties a user's approval to one exact write: the state token is an
+// HMAC over a single-use nonce and the write's resolved fields.
 type confirmations struct {
 	secret []byte
-	// run identifies this process's tokens. The secret and the spent set live
-	// in memory, so a token from an earlier run cannot be checked; the run ID
-	// lets redeem say so instead of reporting a mismatch.
+	// run tags this process's tokens; state is in memory, so redeem reports an
+	// earlier run's token as such rather than as a mismatch.
 	run string
 	now func() time.Time
 
 	mu sync.Mutex
-	// used records a nonce that was accepted. tx is set once broadcast returns
-	// a hash. It stays empty when the approval was spent and broadcast has not
-	// returned one.
+	// used holds accepted nonces; tx is set once broadcast returns a hash.
 	used map[string]spentConfirm
 }
 
@@ -49,6 +53,10 @@ type spentConfirm struct {
 	expiry time.Time
 	tx     *TxRef
 }
+
+// confirmStatus is the result of redeem. Only acceptance spends the nonce,
+// and that happens before broadcast.
+type confirmStatus int
 
 func newConfirmations(now func() time.Time) *confirmations {
 	secret := make([]byte, 32)
@@ -75,28 +83,8 @@ func (c *confirmations) issue(fields ...string) string {
 	return c.run + "." + n + "." + exp + "." + c.mac(n, exp, fields)
 }
 
-// confirmStatus is the result of redeem. Mismatch and expiry do not spend the
-// nonce. A nonce already in the used set was spent on an earlier redeem, which
-// happens before broadcast.
-type confirmStatus int
-
-const (
-	confirmAccepted confirmStatus = iota
-	confirmMismatch
-	// confirmExpired is a token that expired unspent.
-	confirmExpired
-	confirmUsed
-	// confirmStale expired more than spentRetention ago, so whether it was
-	// spent is no longer known.
-	confirmStale
-	// confirmOtherRun was issued by an earlier run of this server, before a
-	// restart, so whether it was spent is not known.
-	confirmOtherRun
-)
-
-// redeem checks a state token against the write's fields and spends it.
-// A mismatch or an expiry leaves the nonce unspent. A nonce that was already
-// accepted stays spent, and is reported as used even after its token expires.
+// redeem checks a state token against fields and spends it. Mismatch or expiry
+// leaves it unspent; a spent nonce reports used even after expiry.
 func (c *confirmations) redeem(state string, fields ...string) confirmStatus {
 	run, nonce, exp, mac, ok := splitConfirmState(state)
 	if !ok {
@@ -136,14 +124,10 @@ func (c *confirmations) redeem(state string, fields ...string) confirmStatus {
 	return confirmAccepted
 }
 
-// noteTx records the hash broadcast returned for an approval that is already
-// spent. It does not store a hash the broadcast has not returned.
+// noteTx records the broadcast hash for an already spent approval.
 func (c *confirmations) noteTx(state string, tx TxRef) {
-	if tx.TxHash == "" {
-		return
-	}
-	run, nonce, _, _, ok := splitConfirmState(state)
-	if !ok || run != c.run {
+	nonce, ok := c.ownNonce(state)
+	if tx.TxHash == "" || !ok {
 		return
 	}
 	c.mu.Lock()
@@ -157,11 +141,10 @@ func (c *confirmations) noteTx(state string, tx TxRef) {
 	c.used[nonce] = rec
 }
 
-// spentTx returns the hash stored for a spent approval, or nil when broadcast
-// has not returned one.
+// spentTx returns the hash stored for a spent approval, or nil.
 func (c *confirmations) spentTx(state string) *TxRef {
-	run, nonce, _, _, ok := splitConfirmState(state)
-	if !ok || run != c.run {
+	nonce, ok := c.ownNonce(state)
+	if !ok {
 		return nil
 	}
 	c.mu.Lock()
@@ -172,6 +155,12 @@ func (c *confirmations) spentTx(state string) *TxRef {
 	}
 	copied := *rec.tx
 	return &copied
+}
+
+// ownNonce is the nonce of a state token this run issued.
+func (c *confirmations) ownNonce(state string) (string, bool) {
+	run, nonce, _, _, ok := splitConfirmState(state)
+	return nonce, ok && run == c.run
 }
 
 func splitConfirmState(state string) (run, nonce, exp, mac string, ok bool) {

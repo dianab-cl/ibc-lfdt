@@ -9,15 +9,15 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// replacements groups the hashes signed for one transfer at one nonce. The
-// relayer re-signs a stalled send with higher fees, which can happen after
-// ibc_ift_send returned, so the hash the agent holds may never be mined. Only
-// one hash of a group can be mined, and it is not always the newest.
+// replacements groups hashes the relayer signed for one transfer at one nonce,
+// so the agent's hash may never mine; only one does, not always the newest.
 type replacements struct {
 	mu     sync.Mutex
 	groups map[string]*[]string // lower-case hash → its group, oldest first
 }
 
+// add records that replacement replaced previous. Pairs may arrive in any order;
+// appending replacement's run to previous's keeps the chain in signing order.
 func (r *replacements) add(previous, replacement string) {
 	previous, replacement = strings.ToLower(previous), strings.ToLower(replacement)
 	r.mu.Lock()
@@ -25,17 +25,25 @@ func (r *replacements) add(previous, replacement string) {
 	if r.groups == nil {
 		r.groups = map[string]*[]string{}
 	}
-	g, ok := r.groups[previous]
+	head, ok := r.groups[previous]
 	if !ok {
-		g = &[]string{previous}
-		r.groups[previous] = g
+		head = &[]string{previous}
+		r.groups[previous] = head
 	}
-	*g = append(*g, replacement)
-	r.groups[replacement] = g
+	tail, ok := r.groups[replacement]
+	if !ok {
+		tail = &[]string{replacement}
+	}
+	if head == tail {
+		return
+	}
+	*head = append(*head, *tail...)
+	for _, h := range *tail {
+		r.groups[h] = head
+	}
 }
 
-// family returns every hash signed for the same transfer as hash, newest
-// first. A hash with no replacement is returned alone.
+// family returns every hash signed for hash's transfer, newest first.
 func (r *replacements) family(hash string) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -50,10 +58,8 @@ func (r *replacements) family(hash string) []string {
 	return out
 }
 
-// noteReplaced records that the relayer re-signed this send's transfer. The
-// tools that take a tx hash then also look at the other hashes, the audit log
-// gets a line under the send's id, and a replay of the spent approval returns
-// the new hash.
+// noteReplaced records a relayer re-sign so tx-hash lookups, the audit log and
+// approval replays all see the new hash.
 func (s *Server) noteReplaced(rec auditRecord, req *mcp.CallToolRequest, chainID, previous, replacement string) {
 	s.replaced.add(previous, replacement)
 	s.noteBroadcast(req, TxRef{ChainID: chainID, TxHash: replacement})
@@ -64,8 +70,7 @@ func (s *Server) noteReplaced(rec auditRecord, req *mcp.CallToolRequest, chainID
 	})
 }
 
-// replacedNote is the warning when a lookup used another hash of the same
-// transfer than the one the caller passed.
+// replacedNote warns when a lookup used a different hash than the caller passed.
 func replacedNote(asked, used string) string {
 	if strings.EqualFold(asked, used) {
 		return ""

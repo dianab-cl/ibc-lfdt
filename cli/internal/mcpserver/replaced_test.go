@@ -53,6 +53,24 @@ func TestReplacementsFamily(t *testing.T) {
 	require.Equal(t, want, r.family(txHash))
 	require.Equal(t, want, r.family(replacementHash), "every hash of a transfer finds the whole group")
 
+	// Reports that arrive out of order still join one group, in signing order.
+	const latestHash = "0x4444444444444444444444444444444444444444444444444444444444444444"
+	var unordered replacements
+	unordered.add(laterHash, latestHash)
+	unordered.add(replacementHash, laterHash)
+	unordered.add(txHash, replacementHash)
+	want = []string{latestHash, laterHash, replacementHash, txHash}
+	for _, h := range want {
+		require.Equal(t, want, unordered.family(h), "family of %s", h)
+	}
+	var split replacements
+	split.add(txHash, replacementHash)
+	split.add(laterHash, latestHash)
+	split.add(replacementHash, laterHash)
+	for _, h := range want {
+		require.Equal(t, want, split.family(h), "family of %s", h)
+	}
+
 	var cased replacements
 	upper := "0xABCD" + txHash[6:]
 	cased.add(upper, replacementHash)

@@ -1035,10 +1035,10 @@ func TestWaitCancelIsToolError(t *testing.T) {
 	require.Equal(t, waitCanceledMessage, raw["message"])
 	require.Equal(t, false, raw["retryable"])
 
-	kept := waitCancelError(newError(CodeRelayerUnavailable, "connection refused"))
+	kept := waitCancelError(NewError(CodeRelayerUnavailable, "connection refused"))
 	require.True(t, kept.Retryable)
 	require.Equal(t, CodeRelayerUnavailable, kept.Code)
-	rpc := waitCancelError(newError(CodeChainRPCError, "timeout"))
+	rpc := waitCancelError(NewError(CodeChainRPCError, "timeout"))
 	require.True(t, rpc.Retryable)
 	plain := waitCancelError(context.DeadlineExceeded)
 	require.False(t, plain.Retryable)

@@ -8,20 +8,19 @@ import (
 	"strings"
 )
 
-// processErrorLog is the http.Server error log. net/http uses it for panics
-// it recovers and for failures while accepting connections. A nil ErrorLog
-// uses the standard log package, which is not the relayer logger.
+// processLogWriter turns one standard-log write into relayer log records,
+// one per line, so a recovered panic stack is kept.
+type processLogWriter struct {
+	logger *slog.Logger
+}
+
+// processErrorLog routes net/http's recovered panics and accept errors to logger
+// instead of the standard log package.
 func processErrorLog(logger *slog.Logger) *log.Logger {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return log.New(processLogWriter{logger: logger}, "", 0)
-}
-
-// processLogWriter turns one standard-log write into relayer log records,
-// one per line, so a recovered panic stack is kept.
-type processLogWriter struct {
-	logger *slog.Logger
 }
 
 func (w processLogWriter) Write(p []byte) (int, error) {

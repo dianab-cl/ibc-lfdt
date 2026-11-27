@@ -542,3 +542,21 @@ func (r *nonceRPC) SendTransaction(_ context.Context, tx *types.Transaction) err
 	r.pending = max(r.pending, tx.Nonce()+1)
 	return nil
 }
+
+func TestRemoteSignerAddressFromSubmitter(t *testing.T) {
+	backend := agentBackend(t, &nonceRPC{height: 1, baseFee: 1, tip: 1, gas: 21_000})
+	backend.cfg.Signers = []config.SignerConfig{
+		{Alias: "agent", Type: config.SignerRemote, GRPC: "localhost:1", RemoteKeyID: "key"},
+	}
+	sub, ok := backend.submitters.Get("1", "agent")
+	require.True(t, ok)
+	want := sub.(*evmsub.TxSubmitter).Address()
+
+	signers, err := backend.Signers(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, []mcpserver.SignerInfo{{Alias: "agent", Address: want}}, signers)
+
+	got, err := backend.ResolveAddress(t.Context(), "agent")
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+}

@@ -122,9 +122,8 @@ func seriesValue(
 }
 
 func TestToolCallMetricsCountApprovalByProtocol(t *testing.T) {
-	// The SDK's multi round-trip middleware runs inside the metrics middleware.
-	// An older client is asked by the server within one call; a 2026-07-28
-	// client gets the approval request as a result and calls again.
+	// Metrics wrap the SDK's multi round-trip middleware: an older client is
+	// prompted within one call, a 2026-07-28 client calls again.
 	for version, calls := range map[string]int64{"2025-11-25": 1, "2026-07-28": 2} {
 		t.Run(version, func(t *testing.T) {
 			reader := sdkmetric.NewManualReader()

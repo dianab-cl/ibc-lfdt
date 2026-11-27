@@ -121,22 +121,30 @@ func relayerRun(cmd *cobra.Command, _ []string) error {
 	address, err := app.Server.Start()
 	if err != nil {
 		app.Logger.Error("Failed to start relayer server", "err", err)
+		_ = app.Store.Close()
 		return err
+	}
+
+	// Optional MCP server on its own port, calling this relayer in-process.
+	// Started before the background loops, so a bad address, token or audit
+	// file stops the process before the relayer has submitted anything. The
+	// relayer API above is already served at this point too.
+	stopMCP, mcpErr := startRelayerMCP(cfg, server.NewRelayerHandler(app.RelayerService), app.TxSubmitters)
+	if mcpErr != nil {
+		app.Logger.Error("Failed to start MCP server", "err", mcpErr)
+		_ = app.Server.Stop()
+		_ = app.Store.Close()
+		return mcpErr
 	}
 
 	if err := app.RelayerService.Start(); err != nil {
 		app.Logger.Error("Failed to start relayer background loops", "err", err)
+		if stopMCP != nil {
+			_ = stopMCP()
+		}
 		_ = app.Server.Stop()
+		_ = app.Store.Close()
 		return err
-	}
-
-	// optional MCP server on its own port, calling this relayer in-process
-	stopMCP, mcpErr := startRelayerMCP(cfg, server.NewRelayerHandler(app.RelayerService), app.TxSubmitters)
-	if mcpErr != nil {
-		app.Logger.Error("Failed to start MCP server", "err", mcpErr)
-		_ = app.RelayerService.Stop()
-		_ = app.Server.Stop()
-		return mcpErr
 	}
 
 	connected := make([]string, 0, len(cfg.Chains))

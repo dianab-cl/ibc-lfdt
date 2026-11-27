@@ -31,8 +31,8 @@ func newToolCallCounter(m metric.Meter) (metric.Int64Counter, error) {
 	return m.Int64Counter("mcp_tool_calls_total")
 }
 
-// trackTool keeps name as a metric label. Names this server did not register
-// are recorded as unknown, so a client cannot grow the series.
+// trackTool allows tool's name as a metric label; unregistered names record as
+// unknown so a client cannot grow the series.
 func (s *Server) trackTool(tool *mcp.Tool) *mcp.Tool {
 	s.knownTools[tool.Name] = struct{}{}
 	return tool
@@ -75,8 +75,7 @@ func (s *Server) metricTool(name string) string {
 	return callToolUnknown
 }
 
-// toolCallOutcome reports success or error, and the tool error code when the
-// call returned one. An empty code is success. Any other failure is "other".
+// toolCallOutcome returns the result label and error code, empty on success.
 func toolCallOutcome(result mcp.Result, callErr error) (string, string) {
 	if callErr != nil {
 		return callResultError, toolErrorCode(callErr)
@@ -96,8 +95,7 @@ func toolErrorCode(err error) string {
 	return callCodeOther
 }
 
-// knownToolCode is every ErrorCode. An unrecognized code is not used as a
-// label: that would let a backend grow the series.
+// knownToolCode limits code labels to known ErrorCodes so a backend cannot grow the series.
 func knownToolCode(code ErrorCode) bool {
 	switch code {
 	case CodeInvalidArgument, CodePolicyDenied, CodeUserDeclined, CodeConfigError,

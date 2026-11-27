@@ -20,6 +20,14 @@ import (
 	"github.com/lfdt-ibc/ibc/cli/internal/service/signer"
 )
 
+// ErrEstimationReverted marks an unbroadcast intent whose gas estimate reverted.
+// It is not transient: it reverts again until chain state changes.
+var ErrEstimationReverted = errors.New("transaction reverts in simulation")
+
+// estimationReverted keeps the RPC error in the chain and adds
+// ErrEstimationReverted to it without changing the message.
+type estimationReverted struct{ error }
+
 func estimateFees(
 	ctx context.Context,
 	eth ETHClient,
@@ -71,7 +79,11 @@ func signTransaction(
 	return signed, nil
 }
 
+// broadcast detaches from ctx so a mid-flight cancel cannot leave it unknown
+// whether the node has tx; broadcastLocked checks ctx just before.
 func broadcast(ctx context.Context, eth ETHClient, tx *types.Transaction) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), requestTimeout)
+	defer cancel()
 	err := eth.SendTransaction(ctx, tx)
 	if err != nil {
 		message := strings.ToLower(err.Error())
@@ -86,23 +98,14 @@ func isReplacementUnderpriced(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "replacement transaction underpriced")
 }
 
-// broadcastMayHaveLanded reports whether SendTransaction failed without the
-// node saying it rejected the transaction. A timeout that is not a dial, a
-// cancel, EOF, or a read or write error can mean the node already accepted
-// it. A refused dial never opened a connection. An HTTP 5xx can arrive after
-// the node has pooled the transaction. A TLS handshake timeout, and a remote
-// or local TLS alert, are returned before the POST body is written. The same
-// failure wrapped as a broken HTTP/1 transport can mean bytes were already
-// written. HTTP/2 replaces a later read with "server sent GOAWAY and closed
-// the connection" after the server has received the stream. A graceful
-// shutdown GOAWAY means the server has not received it.
+// broadcastMayHaveLanded reports whether err (timeout, cancel, EOF, I/O, 5xx, post-stream GOAWAY)
+// may follow the node accepting tx, unlike a dial or a TLS failure before the body.
 func broadcastMayHaveLanded(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Go replaces the read error with this text once the server has received
-	// the stream. It is not a net.Error and does not unwrap to that read.
-	// Checked on the outer error so a *url.Error wrap is included.
+	// Not a net.Error and does not unwrap, so match the text on the outer
+	// error (covers a *url.Error wrap).
 	if http2ServerClosedConnection(err) {
 		return true
 	}
@@ -119,9 +122,8 @@ func broadcastMayHaveLanded(err error) bool {
 	if errors.As(err, &httpErr) {
 		return httpErr.StatusCode >= 500
 	}
-	// *url.Error implements net.Error, so it has to be judged by its cause
-	// before the net.Error check. A handshake failure would otherwise look
-	// like a broadcast that may have landed.
+	// *url.Error is a net.Error: judge its cause first, or a handshake failure
+	// would look like a broadcast that may have landed.
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
 		return broadcastMayHaveLanded(urlErr.Err)
@@ -135,24 +137,20 @@ func broadcastMayHaveLanded(err error) bool {
 	return errors.As(err, &netErr)
 }
 
-// transportConnectionBroken reports net/http's wrap once a broken HTTP/1
-// connection may already have written the request.
+// transportConnectionBroken reports a broken HTTP/1 connection that may have
+// already written the request.
 func transportConnectionBroken(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "net/http: HTTP/1.x transport connection broken")
 }
 
-// http2ServerClosedConnection reports Go's HTTP/2 error after the server has
-// received the stream and then sent GOAWAY. The graceful-shutdown text is a
-// different error: the server has not received the stream, and the HTTP/2
-// client retries that request itself.
+// http2ServerClosedConnection reports a GOAWAY after the server received the
+// stream; a graceful-shutdown GOAWAY (not received, auto-retried) does not match.
 func http2ServerClosedConnection(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "http2: server sent GOAWAY and closed the connection")
 }
 
-// tlsFailedBeforeBody reports a TLS handshake timeout or alert. The timeout is
-// net/http's unexported net.Error with this string. crypto/tls reports an alert
-// as a net.OpError with Op "remote error" or "local error", often wrapped in
-// another net.Error.
+// tlsFailedBeforeBody reports a TLS handshake timeout (matched by text; the type
+// is unexported) or a crypto/tls alert, both raised before the body is sent.
 func tlsFailedBeforeBody(err error) bool {
 	for cur := err; cur != nil; {
 		if cur.Error() == "net/http: TLS handshake timeout" {
@@ -210,22 +208,12 @@ func (c *TxSubmitter) prepareTransaction(
 	}, nil
 }
 
-// ErrEstimationReverted matches a submission whose gas estimate reverted.
-// Nothing was broadcast, and the same intent reverts again until chain state
-// changes, so callers should not report it as a transient RPC failure.
-var ErrEstimationReverted = errors.New("transaction reverts in simulation")
-
-// estimationReverted keeps the RPC error in the chain and adds
-// ErrEstimationReverted to it without changing the message.
-type estimationReverted struct{ error }
-
 func (e estimationReverted) Unwrap() error { return e.error }
 
 func (estimationReverted) Is(target error) bool { return target == ErrEstimationReverted }
 
-// isRevert reports whether an eth_estimateGas error is an EVM revert rather
-// than a transport or node failure. Geth reports a revert as JSON-RPC code 3.
-// Besu before 26.x uses -32000, so its message is matched instead.
+// isRevert reports whether an eth_estimateGas error is an EVM revert: JSON-RPC
+// code 3, or by message for Besu before 26.x, which uses -32000.
 func isRevert(err error) bool {
 	var rpcErr rpc.Error
 	if errors.As(err, &rpcErr) && rpcErr.ErrorCode() == 3 {

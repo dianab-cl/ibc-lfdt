@@ -500,9 +500,8 @@ func TestConfirmClassifiesBroadcastFailures(t *testing.T) {
 	}
 }
 
-// netHTTPHandshakeTimeout is the error http.DefaultTransport returns when the
-// TLS handshake exceeds TLSHandshakeTimeout. The cause is unexported and
-// implements net.Error, and it is produced before the POST body is written.
+// netHTTPHandshakeTimeout returns http.DefaultTransport's TLS handshake timeout:
+// an unexported net.Error produced before the POST body is written.
 func netHTTPHandshakeTimeout(t *testing.T) error {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1108,10 +1107,206 @@ func TestConfirmCountsGasWhenReservationDroppedDuringWait(t *testing.T) {
 	require.False(t, trackedTx(c.chainID, res.hash))
 }
 
+func TestConfirmCountsGasWhenOriginalMinesAfterReplacement(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	polled := make(chan struct{}, 1)
+	var minedHash atomic.Value
+	rpc.receiptFor = func(h common.Hash) (*types.Receipt, error) {
+		select {
+		case polled <- struct{}{}:
+		default:
+		}
+		if m, ok := minedHash.Load().(common.Hash); ok && m == h {
+			return &types.Receipt{
+				Status: types.ReceiptStatusSuccessful, TxHash: h, GasUsed: 21_000, EffectiveGasPrice: big.NewInt(7),
+			}, nil
+		}
+		return nil, ethereum.NotFound
+	}
+	before := walletCost(c)
+
+	type result struct {
+		hash string
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		hash, _, err := c.Confirm(t.Context(), testIntent(), 10*time.Second, nil)
+		done <- result{hash, err}
+	}()
+	<-polled // Confirm broadcast and is waiting for the receipt.
+
+	// The transfer stalls and is re-signed, then the original is mined.
+	c.mu.Lock()
+	expireNonce(c)
+	c.mu.Unlock()
+	require.NoError(t, submit(t, c))
+	original := rpc.sent[0].Hash()
+	require.Equal(t, uint64(0), rpc.sent[1].Nonce())
+	require.NotEqual(t, original, rpc.sent[1].Hash())
+	minedHash.Store(original)
+
+	res := <-done
+	require.NoError(t, res.err)
+	require.Equal(t, original.Hex(), res.hash)
+	require.Equal(t, big.NewInt(21_000*7), new(big.Int).Sub(walletCost(c), before),
+		"the replaced hash is counted when it is the one mined")
+	for _, tx := range rpc.sent[:2] {
+		require.False(t, trackedTx(c.chainID, tx.Hash().Hex()))
+	}
+}
+
+func TestReplacementsReportedInSigningOrder(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	release := make(chan struct{})
+	got := make(chan [2]string, 2)
+	var calls atomic.Int32
+	first, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, func(previous, replacement string) {
+		// Hold the first report until the second replacement is signed.
+		if calls.Add(1) == 1 {
+			<-release
+		}
+		got <- [2]string{previous, replacement}
+	})
+	require.Error(t, err)
+
+	expireNonce(c)
+	require.NoError(t, submit(t, c))
+	expireNonce(c)
+	require.NoError(t, submit(t, c))
+	var replacements []string
+	for _, tx := range rpc.sent {
+		if tx.Nonce() == 0 && tx.Hash().Hex() != first {
+			replacements = append(replacements, tx.Hash().Hex())
+		}
+	}
+	require.Len(t, replacements, 2)
+	close(release)
+
+	for _, want := range [][2]string{{first, replacements[0]}, {replacements[0], replacements[1]}} {
+		select {
+		case report := <-got:
+			require.Equal(t, want, report)
+		case <-time.After(2 * time.Second):
+			t.Fatal("replacement not reported")
+		}
+	}
+}
+
 // walletCost is the cumulative gas cost the metrics hold for c's wallet.
 func walletCost(c *TxSubmitter) *big.Int {
 	metrics.mu.Lock()
 	defer metrics.mu.Unlock()
 	w := metrics.wallets[chainWallet{chainID: c.chainID, wallet: c.address.Hex()}]
 	return new(big.Int).Set(w.cumulativeGasCostWei)
+}
+
+// cancellingSigner signs, then cancels the caller's context, as an MCP client
+// that disconnects between signing and broadcast.
+type cancellingSigner struct {
+	signer.Signer
+	cancel context.CancelFunc
+}
+
+func (s cancellingSigner) Sign(ctx context.Context, digest []byte) ([]byte, error) {
+	sig, err := s.Signer.Sign(ctx, digest)
+	s.cancel()
+	return sig, err
+}
+
+func TestConfirmCancelledBeforeBroadcastDoesNotReserveNonce(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c.signer = cancellingSigner{Signer: c.signer, cancel: cancel}
+	hash, receipt, err := c.Confirm(ctx, testIntent(), time.Second, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Empty(t, hash, "nothing was sent, so there is no hash to report")
+	require.Nil(t, receipt)
+	require.Empty(t, rpc.sent)
+	require.Zero(t, c.nextNonce)
+	require.Empty(t, c.confirmReserved)
+}
+
+// cancelOnSendRPC cancels the caller's context while SendTransaction runs and
+// records whether the send's own context ended with it.
+type cancelOnSendRPC struct {
+	*testRPC
+	cancel  context.CancelFunc
+	sendErr error
+}
+
+func (r *cancelOnSendRPC) SendTransaction(ctx context.Context, tx *types.Transaction) error {
+	r.cancel()
+	r.sendErr = ctx.Err()
+	return r.testRPC.SendTransaction(ctx, tx)
+}
+
+func TestBroadcastOutlivesCallerCancel(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	wrapped := &cancelOnSendRPC{testRPC: rpc, cancel: cancel}
+	c.eth = wrapped
+	submission, err := c.Submit(ctx, testIntent())
+	require.NoError(t, err)
+	require.NotNil(t, submission)
+	require.NoError(t, wrapped.sendErr, "a cancel mid-request must not cut the broadcast")
+}
+
+func TestStallReplacementOutbidsTransferAfterLowerNoncesMine(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	require.NoError(t, submit(t, c))
+	require.NoError(t, submit(t, c))
+	hash, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil)
+	require.Error(t, err)
+	original := rpc.sent[2]
+	require.Equal(t, uint64(2), original.Nonce())
+
+	// Nonces 0 and 1 mine, which clears lastAttemptedFeeCap. The fee estimate
+	// is unchanged.
+	rpc.mined = 2
+	relay := testIntent()
+	relay.Data = []byte{9}
+	require.NoError(t, submitIntent(t, c, relay))
+	expireNonce(c)
+	require.NoError(t, submitIntent(t, c, relay))
+
+	var replacement *types.Transaction
+	for _, tx := range rpc.sent[3:] {
+		if tx.Nonce() == 2 {
+			replacement = tx
+		}
+	}
+	require.NotNil(t, replacement)
+	require.NotEqual(t, hash, replacement.Hash().Hex())
+	require.Equal(t, 1, replacement.GasFeeCap().Cmp(original.GasFeeCap()))
+	require.Equal(t, 1, replacement.GasTipCap().Cmp(original.GasTipCap()))
+	require.Equal(t, []string{hash, replacement.Hash().Hex()}, c.confirmReserved[2].hashes)
+}
+
+func TestIdenticalStallReplacementIsNotReported(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	// No base fee: fee cap equals tip, 8 wei.
+	rpc.baseFee, rpc.tip = 0, 8
+	var replaced atomic.Int32
+	hash, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, func(string, string) {
+		replaced.Add(1)
+	})
+	require.Error(t, err)
+
+	// A fresh estimate of 2 wei caps the bid at 4x, 8 wei: the same transaction.
+	rpc.tip = 2
+	expireNonce(c)
+	relay := testIntent()
+	relay.Data = []byte{9}
+	require.NoError(t, submitIntent(t, c, relay))
+	require.Len(t, rpc.sent, 3)
+	require.Equal(t, hash, rpc.sent[1].Hash().Hex(), "the re-signed transfer is identical")
+	require.Equal(t, uint64(1), rpc.sent[2].Nonce())
+	require.Equal(t, []string{hash}, c.confirmReserved[0].hashes)
+	require.Less(t, time.Since(c.lowestUnminedNoncePendingSince), c.opts.PendingTxTimeout,
+		"the stall timer restarts")
+	time.Sleep(50 * time.Millisecond)
+	require.Zero(t, replaced.Load(), "an identical transaction is not a replacement")
 }

@@ -61,8 +61,7 @@ type AuditLog struct {
 	file *os.File
 }
 
-// OpenAuditLog creates or appends to path. The file is owner-readable only:
-// an existing file that group or others can access is set to 0600 first.
+// OpenAuditLog creates or appends to path, tightening an existing file to 0600.
 func OpenAuditLog(path string) (*AuditLog, error) {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -75,10 +74,8 @@ func OpenAuditLog(path string) (*AuditLog, error) {
 	return &AuditLog{file: f}, nil
 }
 
-// restrictToOwner sets f to mode 0600 when group or others have any access.
-// The create mode only applies to a new file; an existing one keeps its own.
-// A file that cannot be changed, such as one on a read-only mount, is an error
-// rather than a file left readable.
+// restrictToOwner sets f to 0600 if group or others have access (the create mode
+// only covers new files). Failing to is an error rather than a file left readable.
 func restrictToOwner(f *os.File, path string) error {
 	info, err := f.Stat()
 	if err != nil {
@@ -118,7 +115,7 @@ func (a *AuditLog) write(rec auditRecord) error {
 	return a.file.Sync()
 }
 
-// Close stops further records and closes the file. A second call is a no-op.
+// Close closes the file; a second call is a no-op.
 func (a *AuditLog) Close() error {
 	if a == nil {
 		return nil
@@ -141,17 +138,17 @@ func newAuditID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// beginAudit syncs an intent line. The send or relay must not be submitted
-// when this fails: a crash would otherwise leave no record of the attempt.
+// beginAudit syncs an intent line. On error the write must not be submitted,
+// or a crash would leave no record of it.
 func (s *Server) beginAudit(rec auditRecord) (auditRecord, error) {
 	id, err := newAuditID()
 	if err != nil {
-		return auditRecord{}, newError(CodeConfigError, "audit log: %s", err.Error())
+		return auditRecord{}, NewError(CodeConfigError, "audit log: %s", err.Error())
 	}
 	rec.ID = id
 	rec.Outcome = outcomeIntent
 	if err := s.record(rec); err != nil {
-		return auditRecord{}, newError(CodeConfigError, "audit log: %s", err.Error())
+		return auditRecord{}, NewError(CodeConfigError, "audit log: %s", err.Error())
 	}
 	return rec, nil
 }
@@ -174,10 +171,8 @@ func (s *Server) record(rec auditRecord) error {
 	return nil
 }
 
-// logAudit emits one audit event on the relayer's process logger.
-// The line is tool, outcome, chain, and code, plus amount, client, and tx
-// hash when the event has them. It leaves out the message, signer, receiver,
-// and token address: a message can echo an RPC URL or an approval token.
+// logAudit logs rec to the process log, omitting message, addresses and token,
+// since a message can echo an RPC URL or approval token.
 func logAudit(rec auditRecord) {
 	attrs := []any{
 		"tool", rec.Tool,
@@ -197,31 +192,18 @@ func logAudit(rec auditRecord) {
 	slog.With("module", "mcp").Info("MCP audit", attrs...)
 }
 
-// note records a call that did not submit anything. A log failure stays out of
-// the error the caller already has.
+// note records a call that submitted nothing, ignoring a log failure.
 func (s *Server) note(rec auditRecord, err error) {
 	id, idErr := newAuditID()
 	if idErr != nil {
 		return
 	}
 	rec.ID = id
-	fillAudit(&rec, err)
-	_ = s.record(rec)
+	_ = s.finish(rec, err)
 }
 
-// finish records how a submitted call ended.
+// finish records a failed call, taking outcome, code, message and tx hash from err.
 func (s *Server) finish(rec auditRecord, err error) error {
-	fillAudit(&rec, err)
-	return s.record(rec)
-}
-
-func fillAudit(rec *auditRecord, err error) {
-	if err == nil {
-		if rec.Outcome == "" {
-			rec.Outcome = outcomeMined
-		}
-		return
-	}
 	te := asToolError(err, CodeChainRPCError)
 	rec.Code = string(te.Code)
 	rec.Message = te.Message
@@ -240,4 +222,5 @@ func fillAudit(rec *auditRecord, err error) {
 	default:
 		rec.Outcome = outcomeFailed
 	}
+	return s.record(rec)
 }

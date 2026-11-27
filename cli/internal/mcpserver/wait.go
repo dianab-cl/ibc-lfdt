@@ -22,9 +22,7 @@ const (
 	waitNotSelectedHint = "Some packets are not_selected. Call ibc_relay_tx with this chain_id and tx_hash, " +
 		"then call ibc_wait_for_packets again. Do not call ibc_ift_send again."
 	waitMovingHint = "Packets are already moving. Call ibc_wait_for_packets again. Do not call ibc_ift_send again."
-	// waitCanceledMessage is a cancelled wait. Context cancellation is not
-	// CHAIN_RPC_ERROR or RELAYER_UNAVAILABLE, so the result is not retryable.
-	// The message names the next call so the agent does not need that flag.
+	// waitCanceledMessage names the next call, since a cancelled wait is not retryable.
 	waitCanceledMessage = "The wait was cancelled. Call ibc_wait_for_packets again, not ibc_ift_send."
 )
 
@@ -56,6 +54,14 @@ type WaitOutput struct {
 	Hint           string         `json:"hint,omitempty"`
 }
 
+// progressNotifier reports packet state changes to clients that sent a
+// progress token. Progress counts packets that reached the until condition.
+type progressNotifier struct {
+	req   *mcp.CallToolRequest
+	token any
+	step  float64
+}
+
 func (s *Server) waitForPackets(
 	ctx context.Context,
 	req *mcp.CallToolRequest,
@@ -72,7 +78,7 @@ func (s *Server) waitForPackets(
 		until = untilFinal
 	}
 	if until != untilFinal && until != untilReceived {
-		return nil, WaitOutput{}, newError(CodeInvalidArgument, "until must be final or received")
+		return nil, WaitOutput{}, NewError(CodeInvalidArgument, "until must be final or received")
 	}
 	timeout := s.waitDefault
 	if in.TimeoutSeconds > 0 {
@@ -95,11 +101,13 @@ func (s *Server) waitForPackets(
 	var packets []PacketStatus
 	var lastErr *ToolError
 	used := in.TxHash
-	hint := func(h string) string {
+	result := func(done, timedOut bool, hint string) (*mcp.CallToolResult, WaitOutput, error) {
+		out := waitResult(packets, done, timedOut, start)
+		out.Hint = hint
 		if note := replacedNote(in.TxHash, used); note != "" {
-			return note + " " + h
+			out.Hint = note + " " + hint
 		}
-		return h
+		return nil, out, nil
 	}
 
 	for {
@@ -108,16 +116,12 @@ func (s *Server) waitForPackets(
 			packets, used, lastErr = got, gotHash, nil
 			notifier.changes(ctx, seen, packets, until)
 			if len(packets) > 0 && allReached(packets, until) {
-				out := waitResult(packets, true, false, start)
-				out.Hint = hint(waitDoneHint)
-				return nil, out, nil
+				return result(true, false, waitDoneHint)
 			}
 			// not_selected is not in progress. Return the relay hint now
 			// instead of holding the call until timeout_seconds.
 			if countState(packets, StateNotSelected) > 0 {
-				out := waitResult(packets, false, false, start)
-				out.Hint = hint(waitNotSelectedHint)
-				return nil, out, nil
+				return result(false, false, waitNotSelectedHint)
 			}
 		}
 
@@ -126,9 +130,7 @@ func (s *Server) waitForPackets(
 		}
 		if waitCtx.Err() != nil {
 			// The wait's own deadline, not a cancellation: a normal timed-out result.
-			out := waitResult(packets, false, true, start)
-			out.Hint = hint(waitTimeoutHint(packets, lastErr))
-			return nil, out, nil
+			return result(false, true, waitTimeoutHint(packets, lastErr))
 		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -144,30 +146,25 @@ func (s *Server) waitForPackets(
 		case <-ctx.Done():
 			return nil, WaitOutput{}, waitCancelError(ctx.Err())
 		case <-waitCtx.Done():
-			out := waitResult(packets, false, true, start)
-			out.Hint = hint(waitTimeoutHint(packets, lastErr))
-			return nil, out, nil
+			return result(false, true, waitTimeoutHint(packets, lastErr))
 		case <-ticker.C:
 		}
 	}
 }
 
-// waitCancelError is a cancelled ibc_wait_for_packets.
-// A context error is not retryable. CHAIN_RPC_ERROR and RELAYER_UNAVAILABLE
-// keep the existing retry rule, and only when they are not themselves a
-// context cancellation. Other context errors stay non-retryable.
+// waitCancelError makes a cancelled wait non-retryable, except a CHAIN_RPC_ERROR
+// or RELAYER_UNAVAILABLE that is not itself a context error.
 func waitCancelError(err error) *ToolError {
 	var te *ToolError
 	if errors.As(err, &te) && (te.Code == CodeChainRPCError || te.Code == CodeRelayerUnavailable) &&
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		return te
 	}
-	return newError(CodeRelayerError, "%s", waitCanceledMessage)
+	return NewError(CodeRelayerError, "%s", waitCanceledMessage)
 }
 
-// txPackets lists every packet of one source tx. For a send the relayer
-// re-signed it uses whichever hash of that transfer has packets, newest
-// first, and returns the hash it used.
+// txPackets lists a source tx's packets, trying each re-signed hash newest
+// first, and returns the hash that had them.
 func (s *Server) txPackets(ctx context.Context, chainID, txHash string) ([]PacketStatus, string, error) {
 	for _, h := range s.replaced.family(txHash) {
 		packets, err := s.txHashPackets(ctx, chainID, h)
@@ -181,7 +178,7 @@ func (s *Server) txPackets(ctx context.Context, chainID, txHash string) ([]Packe
 	return []PacketStatus{}, txHash, nil
 }
 
-// txHashPackets lists every packet of one source tx hash, following pagination.
+// txHashPackets lists every packet of one source tx hash across all pages.
 func (s *Server) txHashPackets(ctx context.Context, chainID, txHash string) ([]PacketStatus, error) {
 	filter := PacketFilter{SourceChainID: chainID, SourceTxHash: txHash}
 	all := []PacketStatus{}
@@ -189,7 +186,7 @@ func (s *Server) txHashPackets(ctx context.Context, chainID, txHash string) ([]P
 	cursor := ""
 	for {
 		if _, dup := seen[cursor]; dup {
-			return nil, newError(CodeRelayerError, "packet page cursor %q repeated", cursor)
+			return nil, NewError(CodeRelayerError, "packet page cursor %q repeated", cursor)
 		}
 		seen[cursor] = struct{}{}
 		page, err := s.relayer.Packets(ctx, filter, maxPacketsLimit, cursor)
@@ -220,8 +217,7 @@ func allReached(packets []PacketStatus, until string) bool {
 	return true
 }
 
-// waitTimeoutHint is the next step when the wait ended with done false.
-// A timeout stays a normal result. It is not a reason to send again.
+// waitTimeoutHint is the next step after a wait that ended without done.
 func waitTimeoutHint(packets []PacketStatus, lastErr *ToolError) string {
 	switch {
 	case lastErr != nil:
@@ -277,14 +273,6 @@ func waitResult(packets []PacketStatus, done, timedOut bool, start time.Time) Wa
 	return out
 }
 
-// progressNotifier reports packet state changes to clients that sent a
-// progress token. Progress counts packets that reached the until condition.
-type progressNotifier struct {
-	req   *mcp.CallToolRequest
-	token any
-	step  float64
-}
-
 func newProgressNotifier(req *mcp.CallToolRequest) *progressNotifier {
 	n := &progressNotifier{req: req}
 	if req != nil && req.Params != nil {
@@ -293,12 +281,22 @@ func newProgressNotifier(req *mcp.CallToolRequest) *progressNotifier {
 	return n
 }
 
+// changes notifies one progress step per packet whose state differs from seen.
 func (n *progressNotifier) changes(
 	ctx context.Context,
 	seen map[string]PacketState,
 	packets []PacketStatus,
 	until string,
 ) {
+	if n.token == nil || n.req.Session == nil {
+		return
+	}
+	done := 0
+	for _, p := range packets {
+		if reached(p, until) {
+			done++
+		}
+	}
 	for _, p := range packets {
 		key := p.SourceClientID + "/" + p.Sequence
 		prev, known := seen[key]
@@ -311,27 +309,13 @@ func (n *progressNotifier) changes(
 		if known {
 			msg = fmt.Sprintf("packet %s: %s -> %s", key, prev, p.State)
 		}
-		n.notify(ctx, msg, packets, until)
+		// Progress must strictly increase and packets can appear mid-wait, so it
+		// counts state changes; the message carries the packet tally.
+		n.step++
+		_ = n.req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
+			ProgressToken: n.token,
+			Message:       fmt.Sprintf("%s (%d/%d packets done)", msg, done, len(packets)),
+			Progress:      n.step,
+		})
 	}
-}
-
-func (n *progressNotifier) notify(ctx context.Context, msg string, packets []PacketStatus, until string) {
-	if n.token == nil || n.req.Session == nil {
-		return
-	}
-	done := 0
-	for _, p := range packets {
-		if reached(p, until) {
-			done++
-		}
-	}
-	// Progress must strictly increase across notifications, and packets can
-	// appear mid-wait, so it counts state changes; the message carries the
-	// packet tally.
-	n.step++
-	_ = n.req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
-		ProgressToken: n.token,
-		Message:       fmt.Sprintf("%s (%d/%d packets done)", msg, done, len(packets)),
-		Progress:      n.step,
-	})
 }

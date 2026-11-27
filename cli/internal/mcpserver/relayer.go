@@ -13,15 +13,22 @@ import (
 	"github.com/lfdt-ibc/ibc/cli/api/v2/relayer"
 )
 
-// RelayerAPI adapts the relayer's RelayerApiService to RelayerBackend. Inside
-// `ibc relayer run` it wraps the same handler the relayer serves on its API,
-// called in-process, so MCP gets the API's validation and errors without a
-// network hop. A Connect client works too, since it has the same methods.
+var _ RelayerBackend = (*RelayerAPI)(nil)
+
+var stateProto = map[PacketState]relayer.PacketState{
+	StateNotSelected: relayer.PacketState_PACKET_STATE_NOT_SELECTED,
+	StatePending:     relayer.PacketState_PACKET_STATE_PENDING,
+	StateSucceeded:   relayer.PacketState_PACKET_STATE_SUCCEEDED,
+	StateTimedOut:    relayer.PacketState_PACKET_STATE_TIMED_OUT,
+	StateRejected:    relayer.PacketState_PACKET_STATE_REJECTED,
+	StateRelayFailed: relayer.PacketState_PACKET_STATE_RELAY_FAILED,
+}
+
+// RelayerAPI adapts RelayerApiService to RelayerBackend, in-process via the
+// relayer's own handler (same validation, no network hop) or via a Connect client.
 type RelayerAPI struct {
 	api relayer.RelayerApiServiceClient
 }
-
-var _ RelayerBackend = (*RelayerAPI)(nil)
 
 // NewRelayerAPI wraps api: a RelayerApiServiceHandler or a client for one.
 func NewRelayerAPI(api relayer.RelayerApiServiceClient) *RelayerAPI {
@@ -39,7 +46,7 @@ func (r *RelayerAPI) Relay(
 		for _, p := range packets {
 			seq, err := strconv.ParseUint(p.Sequence, 10, 64)
 			if err != nil {
-				return nil, newError(CodeInvalidArgument, "invalid sequence %q", p.Sequence)
+				return nil, NewError(CodeInvalidArgument, "invalid sequence %q", p.Sequence)
 			}
 			selected = append(selected, &relayer.PacketSelector{SourceClientId: p.SourceClientID, SequenceNumber: seq})
 		}
@@ -78,7 +85,7 @@ func (r *RelayerAPI) Packets(
 	if filter.State != "" {
 		state, ok := stateToProto(filter.State)
 		if !ok {
-			return PacketsPage{}, newError(CodeInvalidArgument, "unknown state %q", filter.State)
+			return PacketsPage{}, NewError(CodeInvalidArgument, "unknown state %q", filter.State)
 		}
 		pf.State = &state
 	}
@@ -122,15 +129,6 @@ func txFromProto(tx *relayer.TransactionInfo) *TxRef {
 	return &TxRef{ChainID: tx.GetChainId(), TxHash: tx.GetTxHash()}
 }
 
-var stateProto = map[PacketState]relayer.PacketState{
-	StateNotSelected: relayer.PacketState_PACKET_STATE_NOT_SELECTED,
-	StatePending:     relayer.PacketState_PACKET_STATE_PENDING,
-	StateSucceeded:   relayer.PacketState_PACKET_STATE_SUCCEEDED,
-	StateTimedOut:    relayer.PacketState_PACKET_STATE_TIMED_OUT,
-	StateRejected:    relayer.PacketState_PACKET_STATE_REJECTED,
-	StateRelayFailed: relayer.PacketState_PACKET_STATE_RELAY_FAILED,
-}
-
 func stateToProto(s PacketState) (relayer.PacketState, bool) {
 	v, ok := stateProto[s]
 	return v, ok
@@ -158,15 +156,13 @@ func selectionFromProto(s relayer.PacketSelection) PacketSelection {
 	}
 }
 
-// relayTxError classifies a Relay failure. A just-mined transaction often
-// answers NotFound, "no packets found", before the node serves the receipt.
-// That one result is retryable so the agent calls ibc_relay_tx again. Other
-// INVALID_ARGUMENT results, including a different NotFound, are not.
+// relayTxError makes only NotFound "no packets found" retryable: a just-mined tx
+// returns it until the node serves the receipt.
 func relayTxError(err error) *ToolError {
 	var ce *connect.Error
 	if errors.As(err, &ce) && ce.Code() == connect.CodeNotFound &&
 		strings.Contains(ce.Message(), "no packets found") {
-		te := newError(CodeInvalidArgument, "relayer: %s. Retry ibc_relay_tx", ce.Message())
+		te := NewError(CodeInvalidArgument, "relayer: %s. Retry ibc_relay_tx", ce.Message())
 		te.Retryable = true
 		return te
 	}
@@ -179,14 +175,14 @@ func relayerError(err error) *ToolError {
 	if errors.As(err, &ce) {
 		switch ce.Code() {
 		case connect.CodeUnavailable, connect.CodeDeadlineExceeded, connect.CodeCanceled:
-			return newError(CodeRelayerUnavailable, "relayer: %s", ce.Message())
+			return NewError(CodeRelayerUnavailable, "relayer: %s", ce.Message())
 		case connect.CodeInvalidArgument, connect.CodeNotFound, connect.CodeFailedPrecondition:
-			return newError(CodeInvalidArgument, "relayer: %s", ce.Message())
+			return NewError(CodeInvalidArgument, "relayer: %s", ce.Message())
 		default:
-			return newError(CodeRelayerError, "relayer: %s", ce.Message())
+			return NewError(CodeRelayerError, "relayer: %s", ce.Message())
 		}
 	}
-	return newError(CodeRelayerUnavailable, "relayer: %s", err.Error())
+	return NewError(CodeRelayerUnavailable, "relayer: %s", err.Error())
 }
 
 func nonEmpty(s string) *string {

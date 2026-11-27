@@ -366,3 +366,25 @@ func TestCloseDoesNotWaitAgainAfterHTTPStopDeadline(t *testing.T) {
 	require.NoError(t, srv.Close())
 	require.Less(t, time.Since(start), 100*time.Millisecond, "MCP stays within one deadline")
 }
+
+func TestCloseAfterHTTPStopDeadlineDoesNotWarnWithoutWrites(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	// Repeated: with the timer already expired, select used to pick it over a
+	// drained wait at random.
+	for range 50 {
+		log, err := OpenAuditLog(filepath.Join(t.TempDir(), AuditFileName))
+		require.NoError(t, err)
+		srv, err := New(&fakeChain{}, &fakeRelayer{}, Options{Audit: log})
+		require.NoError(t, err)
+		srv.stop()
+		srv.writesMu.Lock()
+		srv.stopStarted = time.Now().Add(-2 * writeDrainTimeout)
+		srv.writesMu.Unlock()
+		require.NoError(t, srv.Close())
+	}
+	require.NotContains(t, logs.String(), "MCP write still running")
+}
