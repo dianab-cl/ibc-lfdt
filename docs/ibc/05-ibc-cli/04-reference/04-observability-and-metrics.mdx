@@ -109,12 +109,22 @@ Collections inside that threshold re-emit the last observed value. A failed quer
 | dispatch | `packet_poll_last_success_timestamp_seconds` | gauge | none | Unix timestamp of the last completed successful poll, including empty polls. Initially 0; listing errors and blocked polls leave it unchanged. |
 | dispatch    | `packets_pending`               | gauge              | `chain_id`, `dest_chain_id`, `client_id`, `dest_client_id`          | Pending packets per route                                      |
 | dispatch    | `excessive_relay_latency_total` | counter            | `chain_id`, `dest_chain_id`, `client_id`, `dest_client_id`, `type`  | +1 per poll while a packet is pending past its leg threshold   |
+| mcpserver   | `mcp_tool_calls_total`          | counter            | `tool`, `result`, `code`                                            | +1 per MCP tool call. `tool` is a registered tool name or `unknown`. `result` is `ok` or `error`. `code` is empty on success, the tool error code on a tool error, and `other` otherwise. |
 
 `excessive_relay_latency_total` counts packets still pending past a per-leg threshold, using the
 same `type` values as processor metrics (`send_to_recv`, `send_to_timeout`, `recv_to_ack`). It is an
 event counter, not a failure gauge: a packet that remains stuck increments on every dispatcher poll,
 so alerts should be built on `rate()`. The threshold is hard-coded for now (60m pending; timeouts 5m
 past the packet timeout, with a 15m source-finality guard) and can move to config in the future.
+
+`mcp_tool_calls_total` counts tool calls on the MCP server inside `ibc relayer run`.
+`tool` is one of the registered tools, or `unknown` for any other name. `code` is
+empty when `result` is `ok`. A tool error uses its code: `INVALID_ARGUMENT`,
+`POLICY_DENIED`, `USER_DECLINED`, `CONFIG_ERROR`, `CHAIN_RPC_ERROR`,
+`TX_REVERTED`, `TX_NOT_CONFIRMED`, `RELAYER_UNAVAILABLE`, or `RELAYER_ERROR`.
+Anything else is `other`. Amounts, addresses, transaction hashes, and RPC URLs
+are not label values. A call that asks for confirmation counts as `ok`; the
+retry is another call.
 
 ### EVM client metrics
 

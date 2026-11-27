@@ -17,6 +17,7 @@ import (
 	"github.com/cosmos/ibc/cli/internal/config"
 	"github.com/cosmos/ibc/cli/internal/otel"
 	"github.com/cosmos/ibc/cli/internal/pkg/graceful"
+	"github.com/cosmos/ibc/cli/internal/server"
 )
 
 var (
@@ -129,6 +130,15 @@ func relayerRun(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	// optional MCP server on its own port, calling this relayer in-process
+	stopMCP, mcpErr := startRelayerMCP(cfg, server.NewRelayerHandler(app.RelayerService), app.TxSubmitters)
+	if mcpErr != nil {
+		app.Logger.Error("Failed to start MCP server", "err", mcpErr)
+		_ = app.RelayerService.Stop()
+		_ = app.Server.Stop()
+		return mcpErr
+	}
+
 	connected := make([]string, 0, len(cfg.Chains))
 	for _, chain := range cfg.Chains {
 		connected = append(connected, chain.ChainID)
@@ -144,6 +154,9 @@ func relayerRun(cmd *cobra.Command, _ []string) error {
 	graceful.AddCallback(app.Store.Close)
 	graceful.AddCallback(app.Server.Stop)
 	graceful.AddCallback(app.RelayerService.Stop)
+	if stopMCP != nil {
+		graceful.AddCallback(stopMCP)
+	}
 
 	// blocking
 	return graceful.WaitShutdown()

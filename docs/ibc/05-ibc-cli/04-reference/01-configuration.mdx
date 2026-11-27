@@ -161,7 +161,7 @@ For example, `signer: attestor-dan-base-key` selects the signer whose alias is `
 |---|---|---|---|
 | `listenAddr` | `string` | `0.0.0.0:3000` | Address the gRPC server binds. It serves the relayer and attestor APIs together. |
 
-{/* [config.go:L82](cli/internal/config/config.go#L82) */}
+{/* [config.go:L91](cli/internal/config/config.go#L91) */}
 
 {/* GEN:config:server END */}
 
@@ -180,7 +180,7 @@ survives an ordinary invocation.
 | `level` | `string` | `info` | A slog level name (debug, info, warn, error). Empty defaults to info. |
 | `json` | `bool` | optional | Emits logs as JSON instead of text. |
 
-{/* [config.go:L88](cli/internal/config/config.go#L88) */}
+{/* [config.go:L97](cli/internal/config/config.go#L97) */}
 
 {/* GEN:config:logging END */}
 
@@ -198,7 +198,7 @@ survives an ordinary invocation.
 | `type` | `sqlite` \| `postgres` | `sqlite` | Database backend. |
 | `url` | `string` | `ibc.db` | File path for sqlite, connection string for postgres. `:memory:` is rejected. |
 
-{/* [config.go:L96](cli/internal/config/config.go#L96) */}
+{/* [config.go:L105](cli/internal/config/config.go#L105) */}
 
 {/* GEN:config:db END */}
 
@@ -219,7 +219,7 @@ is disabled.
 | `simpleMetricsListenAddr` | `string` | `0.0.0.0:9090` | The Prometheus listener address in simple mode. |
 | `otelFile` | `string` | **required** for `otel` | The OTEL configuration file, overridden by OTEL_CONFIG_FILE. One of the two is required. |
 
-{/* [config.go:L102](cli/internal/config/config.go#L102) */}
+{/* [config.go:L111](cli/internal/config/config.go#L111) */}
 
 {/* GEN:config:observability END */}
 
@@ -245,7 +245,7 @@ See [Observability and metrics](/ibc/05-ibc-cli/04-reference/04-observability-an
 | `evm.ics26Router` | `string` | **required** to run | Address of the ICS26 router on the chain. |
 | `evm.ibcMulticall` | `string` | **required** to relay | The batching contract address, required to run the relayer. |
 
-{/* [config.go:L119](cli/internal/config/config.go#L119) */}
+{/* [config.go:L128](cli/internal/config/config.go#L128) */}
 
 {/* GEN:config:chains END */}
 
@@ -352,7 +352,7 @@ Receive batches use the destination chain's settings. Acknowledgement and timeou
 | `signer` | `string` | **required** | The signer used to sign attestations. |
 | `finalityOffset` | `uint` | optional | Zero attests up to the chain's `finalized` tag; n > 0 attests up to `latest` - n instead. |
 
-{/* [config.go:L146](cli/internal/config/config.go#L146) */}
+{/* [config.go:L155](cli/internal/config/config.go#L155) */}
 
 {/* GEN:config:attestors:local END */}
 
@@ -380,7 +380,7 @@ attestors:
 | `tls.serverName` | `string` | optional | Overrides the name verified against the server certificate. Needed when dialing an address that differs from the certificate's name. |
 | `tls.insecureSkipVerify` | `bool` | optional | Disables server certificate verification and logs a warning. Development only. Must not be combined with caFile. |
 
-{/* [config.go:L146](cli/internal/config/config.go#L146) */}
+{/* [config.go:L155](cli/internal/config/config.go#L155) */}
 
 {/* GEN:config:attestors:remote END */}
 
@@ -406,7 +406,7 @@ Use separate signing keys for independent clients and chains. See [Attestor keys
 | `type` | `local` | **required** | Whether the key is a file on disk or a key held by a remote signer. |
 | `file` | `string` | **required** | Key file path for a local signer. |
 
-{/* [config.go:L175](cli/internal/config/config.go#L175) */}
+{/* [config.go:L184](cli/internal/config/config.go#L184) */}
 
 {/* GEN:config:signers:local END */}
 
@@ -436,11 +436,30 @@ signers:
 | `tls.serverName` | `string` | optional | Overrides the name verified against the server certificate. Needed when dialing an address that differs from the certificate's name. |
 | `tls.insecureSkipVerify` | `bool` | optional | Disables server certificate verification and logs a warning. Development only. Must not be combined with caFile. |
 
-{/* [config.go:L175](cli/internal/config/config.go#L175) */}
+{/* [config.go:L184](cli/internal/config/config.go#L184) */}
 
 {/* GEN:config:signers:remote END */}
 
 The remote signer holds the key material and performs signing.
+
+## `mcp`
+
+`ibc relayer run` can serve [Model Context Protocol](https://modelcontextprotocol.io) tools from this block, on its own port beside the relayer API. Omit `mcp`, or leave `listenAddr` empty, and the relayer runs without MCP. {/* [cli/cmd/ibc/mcp.go: startRelayerMCP] */}
+
+{/* GEN:config:mcp START */}
+
+| Key | Type | Default or required | Description |
+|---|---|---|---|
+| `listenAddr` | `string` | optional | A loopback host:port, such as `127.0.0.1:3001`. Empty leaves the MCP server off. |
+| `auditLog` | `string` | optional | Append-only JSONL file of MCP writes. Empty uses mcp-audit.jsonl in the IBC home. |
+
+{/* [config.go:L83](cli/internal/config/config.go#L83) */}
+
+{/* GEN:config:mcp END */}
+
+The address has no authentication and can sign, so the address that is bound has to be loopback: `127.0.0.1`, `::1`, or `localhost`. A public address is refused at startup. {/* [cli/internal/mcpserver/http.go: RequireLoopback] */} `--mcp-listen` overrides `listenAddr` for one run, including when the file names a public address.
+
+MCP does not mint and does not cap token amounts. Mint stays on `ibc tx ift mint`, and a send is whatever that client's signer can already submit. While the server is on, each send and relay is appended to `auditLog` before it is submitted. An empty `auditLog` uses `mcp-audit.jsonl` in the IBC home. A relative path is joined to that home. The parent directory has to exist; a path that cannot be opened stops the relayer from starting. {/* [cli/cmd/ibc/mcp.go: mcpAuditPath] */}
 
 ## TLS for remote services
 

@@ -87,3 +87,5 @@ attestors:
     chainId: "1"
     type: local
     signer: "attestor-dan-key-eth"
+mcp:
+  listenAddr: 127.0.0.1:3001

@@ -1243,3 +1243,57 @@ func TestRelayerRequiresMulticallForEveryEVMChain(t *testing.T) {
 	cfg.Chains[2].EVM.IBCMulticall = "0x0000000000000000000000000000000000000002"
 	require.NoError(t, cfg.RelayerSufficiency())
 }
+
+func TestMCPListenAddr(t *testing.T) {
+	t.Run("absent or empty", func(t *testing.T) {
+		require.NoError(t, DefaultConfig().Validate())
+		cfg := DefaultConfig()
+		cfg.MCP.ListenAddr = ""
+		require.NoError(t, cfg.Validate())
+		require.Empty(t, cfg.MCP.ListenAddr)
+	})
+
+	for _, addr := range []string{"127.0.0.1:3001", "localhost:3001", "[::1]:3001"} {
+		t.Run(addr, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.MCP.ListenAddr = addr
+			require.NoError(t, cfg.Validate())
+		})
+	}
+
+	t.Run("public stays in the file", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MCP.ListenAddr = "0.0.0.0:3001"
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("load", func(t *testing.T) {
+		path := writeTestConfig(t, `
+mcp:
+  listenAddr: 127.0.0.1:3001
+`)
+		cfg, err := LoadFromFile(path, true)
+		require.NoError(t, err)
+		require.Equal(t, "127.0.0.1:3001", cfg.MCP.ListenAddr)
+
+		path = writeTestConfig(t, `
+mcp:
+  listenAddr: 1.2.3.4:3001
+`)
+		cfg, err = LoadFromFile(path, true)
+		require.NoError(t, err)
+		require.Equal(t, "1.2.3.4:3001", cfg.MCP.ListenAddr)
+	})
+
+	t.Run("audit log path", func(t *testing.T) {
+		path := writeTestConfig(t, `
+mcp:
+  listenAddr: 127.0.0.1:3001
+  auditLog: /var/log/ibc/mcp-audit.jsonl
+`)
+		cfg, err := LoadFromFile(path, true)
+		require.NoError(t, err)
+		require.Equal(t, "/var/log/ibc/mcp-audit.jsonl", cfg.MCP.AuditLog)
+		require.NoError(t, cfg.Validate())
+	})
+}

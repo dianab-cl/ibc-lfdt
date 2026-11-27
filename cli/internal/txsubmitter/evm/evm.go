@@ -32,6 +32,8 @@ const (
 	maxBroadcastAttempts = 8
 	// feeCeilingMultiplier caps fees relative to the fresh estimate for each Submit.
 	feeCeilingMultiplier = 4
+	// receiptPollInterval is how often Confirm checks for a mined receipt.
+	receiptPollInterval = 200 * time.Millisecond
 )
 
 // ChainOptions controls transaction retry timing.
@@ -69,6 +71,9 @@ type TxSubmitter struct {
 	lowestUnminedNoncePendingSince time.Time
 	lastAttemptedFeeCap            *big.Int
 	lastAttemptedTipCap            *big.Int
+	// confirmReserved nonces were broadcast by Confirm. selectNonce does not
+	// hand one to a later intent while PendingNonceAt is still above it.
+	confirmReserved map[uint64]struct{}
 }
 
 // ErrBusy leaves the packet available for a later dispatch.
@@ -122,15 +127,92 @@ func (c *TxSubmitter) Submit(ctx context.Context, intent v2.TxIntent) (_ *v2.Sub
 	}()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The relayer retries a lost broadcast itself. Do not reserve the nonce here:
+	// the next attempt reuses it unless the node already reports it pending.
+	sub, _, err := c.submitLocked(ctx, intent, false)
+	if err != nil {
+		return nil, err
+	}
+	return sub, nil
+}
+
+// Confirm signs and broadcasts intent with this submitter's nonce and signer,
+// then waits for the receipt. The nonce is reserved before that wait and is
+// not given to a later intent while the node still reports it pending, so the
+// signer lock is not held during the wait. Other nonces on this account can
+// proceed.
+//
+// A non-empty hash with a non-nil error means the transaction was signed and
+// the broadcast may have reached the node. The nonce is reserved in that case.
+// Callers must report that hash and must not treat it as a failure with no
+// transaction.
+func (c *TxSubmitter) Confirm(
+	ctx context.Context, intent v2.TxIntent, confirmTimeout time.Duration,
+) (hash string, receipt *types.Receipt, err error) {
+	defer func() {
+		metrics.attempt(ctx, c.chainID, c.address.Hex(), err)
+		if err != nil && hash == "" {
+			slog.WarnContext(ctx, "Transaction submission unsuccessful",
+				"chainID", c.chainID, "sender", c.address.Hex(), "err", err.Error())
+		}
+	}()
+	c.mu.Lock()
+
+	// If this broadcast is the lowest unmined nonce, noteAccepted moves this
+	// timestamp. A failed wait puts it back to now so the next submission does
+	// not immediately replace a transfer that may still be in flight.
+	pendingSince := c.lowestUnminedNoncePendingSince
+	sub, nonce, submitErr := c.submitLocked(ctx, intent, true)
+	if sub == nil {
+		c.mu.Unlock()
+		return "", nil, submitErr
+	}
+	hash = sub.TxHash
+	restartStallTimer := nonce == c.lowestUnminedNonce && !c.lowestUnminedNoncePendingSince.Equal(pendingSince)
+	if confirmTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, confirmTimeout)
+		defer cancel()
+	}
+	// Other submissions can use later nonces while this receipt is outstanding.
+	// confirmReserved keeps them off this nonce until the node reports it free.
+	c.mu.Unlock()
+	receipt, err = c.waitReceipt(ctx, common.HexToHash(hash))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err != nil {
+		metrics.forgetTx(c.chainID, hash)
+		if restartStallTimer && c.lowestUnminedNonce == nonce {
+			c.lowestUnminedNoncePendingSince = time.Now()
+		}
+		if submitErr != nil {
+			err = errors.Wrap(submitErr, err.Error())
+		}
+		slog.WarnContext(ctx, "Transaction broadcast but not confirmed",
+			"chainID", c.chainID, "sender", c.address.Hex(), "txHash", hash)
+		return hash, nil, err
+	}
+	metrics.endTx(c.chainID, receipt)
+	return hash, receipt, nil
+}
+
+// submitLocked signs and broadcasts. The caller holds c.mu.
+// When reserveUnconfirmed is set and the node may have accepted the
+// transaction, the nonce is recorded the way a successful broadcast is and
+// the submission is returned together with the broadcast error.
+func (c *TxSubmitter) submitLocked(
+	ctx context.Context, intent v2.TxIntent, reserveUnconfirmed bool,
+) (*v2.Submission, uint64, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	nonce, head, err := c.selectNonce(ctx, time.Now())
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	fee, tip, err := estimateFees(ctx, c.eth, head.BaseFee)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	feeCeiling := new(big.Int).Mul(fee, big.NewInt(feeCeilingMultiplier))
 	if nonce == c.lowestUnminedNonce && c.lastAttemptedFeeCap != nil {
@@ -139,34 +221,40 @@ func (c *TxSubmitter) Submit(ctx context.Context, intent v2.TxIntent) (_ *v2.Sub
 	fee, tip = capFees(fee, tip, feeCeiling)
 	txData, err := c.prepareTransaction(ctx, intent.To, intent.Data, nonce, fee, tip)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	for range maxBroadcastAttempts {
 		txData.GasFeeCap, txData.GasTipCap = fee, tip
 		tx, err := signTransaction(ctx, types.NewTx(txData), c.signer, c.ethSigner, c.address)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		submittedAt := time.Now().UTC()
 		err = broadcast(ctx, c.eth, tx)
 		if err == nil {
-			c.nextNonce = max(c.nextNonce, nonce+1)
-			if nonce == c.lowestUnminedNonce {
-				c.lastAttemptedFeeCap, c.lastAttemptedTipCap = fee, tip
-				c.lowestUnminedNoncePendingSince = time.Now()
-			}
+			c.noteAccepted(nonce, fee, tip, reserveUnconfirmed)
 			metrics.startTx(c.chainID, c.address.Hex(), tx.Hash().Hex())
 			slog.InfoContext(ctx, "Transaction submitted", c.transactionAttributes(tx, head.BaseFee)...)
 			return &v2.Submission{
 				TxHash:         tx.Hash().Hex(),
 				SubmittedAt:    submittedAt,
 				RelayerAddress: c.address.Hex(),
-			}, nil
+			}, nonce, nil
 		}
 		slog.WarnContext(ctx, "Transaction broadcast rejected or unconfirmed",
 			append(c.transactionAttributes(tx, head.BaseFee), "err", chainsevm.ExplainRevert(err).Error())...)
 		if !isReplacementUnderpriced(err) {
-			return nil, errors.Wrapf(err, "broadcasting transaction %s at nonce %d", tx.Hash(), nonce)
+			wrapped := errors.Wrapf(err, "broadcasting transaction %s at nonce %d", tx.Hash(), nonce)
+			if reserveUnconfirmed && broadcastMayHaveLanded(err) {
+				c.noteAccepted(nonce, fee, tip, true)
+				metrics.startTx(c.chainID, c.address.Hex(), tx.Hash().Hex())
+				return &v2.Submission{
+					TxHash:         tx.Hash().Hex(),
+					SubmittedAt:    submittedAt,
+					RelayerAddress: c.address.Hex(),
+				}, nonce, wrapped
+			}
+			return nil, 0, wrapped
 		}
 		if nonce == c.lowestUnminedNonce {
 			c.lastAttemptedFeeCap, c.lastAttemptedTipCap = fee, tip
@@ -183,17 +271,69 @@ func (c *TxSubmitter) Submit(ctx context.Context, intent v2.TxIntent) (_ *v2.Sub
 					"err",
 					err.Error(),
 				)...)
-			return nil, errors.Wrapf(err,
+			return nil, 0, errors.Wrapf(err,
 				"fee ceiling %s wei (%dx fresh estimate) reached for nonce %d",
 				feeCeiling, feeCeilingMultiplier, nonce)
 		}
 		fee, tip = nextFee, nextTip
 	}
-	return nil, errors.Errorf(
+	return nil, 0, errors.Errorf(
 		"replacement still underpriced after %d attempts at nonce %d",
 		maxBroadcastAttempts,
 		nonce,
 	)
+}
+
+// noteAccepted records a broadcast the node may now have. The caller holds c.mu.
+// When reserve is set, Confirm keeps the nonce until the node reports it mined or free.
+func (c *TxSubmitter) noteAccepted(nonce uint64, fee, tip *big.Int, reserve bool) {
+	c.nextNonce = max(c.nextNonce, nonce+1)
+	if reserve {
+		if c.confirmReserved == nil {
+			c.confirmReserved = make(map[uint64]struct{})
+		}
+		c.confirmReserved[nonce] = struct{}{}
+	}
+	if nonce == c.lowestUnminedNonce {
+		c.lastAttemptedFeeCap, c.lastAttemptedTipCap = fee, tip
+		c.lowestUnminedNoncePendingSince = time.Now()
+	}
+}
+
+// confirmNonceInFlight reports whether Confirm reserved nonce and the node
+// still has a transaction at or beyond it.
+func (c *TxSubmitter) confirmNonceInFlight(nonce, pending uint64) bool {
+	_, reserved := c.confirmReserved[nonce]
+	return reserved && pending > nonce
+}
+
+// waitReceipt polls until the transaction is mined or ctx ends.
+// It does not use c.mu. Confirm releases the signer lock for the wait.
+func (c *TxSubmitter) waitReceipt(ctx context.Context, hash common.Hash) (*types.Receipt, error) {
+	var last error
+	ticker := time.NewTicker(receiptPollInterval)
+	defer ticker.Stop()
+	for {
+		receipt, err := c.eth.TransactionReceipt(ctx, hash)
+		switch {
+		case err == nil && receipt != nil:
+			return receipt, nil
+		case err == nil:
+			last = errors.New("empty receipt")
+		case errors.Is(err, ethereum.NotFound):
+			last = err
+		default:
+			last = err
+		}
+		select {
+		case <-ctx.Done():
+			if last != nil {
+				return nil, last
+			}
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (c *TxSubmitter) transactionAttributes(tx *types.Transaction, baseFee *big.Int) []any {
@@ -231,12 +371,22 @@ func (c *TxSubmitter) selectNonce(ctx context.Context, now time.Time) (uint64, *
 		c.lowestUnminedNonce, c.lowestUnminedNoncePendingSince = mined, time.Time{}
 		c.lastAttemptedFeeCap, c.lastAttemptedTipCap = nil, nil
 	}
+	for reserved := range c.confirmReserved {
+		if reserved < mined {
+			delete(c.confirmReserved, reserved)
+		}
+	}
 	c.nextNonce = max(c.nextNonce, mined, pending)
 	if c.nextNonce > mined {
 		if c.lowestUnminedNoncePendingSince.IsZero() {
 			c.lowestUnminedNoncePendingSince = now
 		}
-		if now.Sub(c.lowestUnminedNoncePendingSince) >= c.opts.PendingTxTimeout {
+		// A Confirm transfer keeps its nonce while the node still has it
+		// pending. After the stall timeout that nonce can be reused once
+		// PendingNonceAt is no longer above it.
+		if now.Sub(c.lowestUnminedNoncePendingSince) >= c.opts.PendingTxTimeout &&
+			!c.confirmNonceInFlight(mined, pending) {
+			delete(c.confirmReserved, mined)
 			return mined, head, nil
 		}
 	}

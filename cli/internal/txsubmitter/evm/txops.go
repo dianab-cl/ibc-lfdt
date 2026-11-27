@@ -4,12 +4,16 @@ package evm
 
 import (
 	"context"
+	"io"
 	"math/big"
+	"net"
+	"net/url"
 	"strings"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/pkg/errors"
 
 	chainsevm "github.com/cosmos/ibc/cli/internal/chains/evm"
@@ -80,6 +84,88 @@ func broadcast(ctx context.Context, eth ETHClient, tx *types.Transaction) error 
 
 func isReplacementUnderpriced(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "replacement transaction underpriced")
+}
+
+// broadcastMayHaveLanded reports whether SendTransaction failed without the
+// node saying it rejected the transaction. A timeout that is not a dial, a
+// cancel, EOF, or a read or write error can mean the node already accepted
+// it. A refused dial never opened a connection. An HTTP 5xx can arrive after
+// the node has pooled the transaction. A TLS handshake timeout, and a remote
+// or local TLS alert, are returned before the POST body is written. The same
+// failure wrapped as a broken HTTP/1 transport can mean bytes were already
+// written. HTTP/2 replaces a later read with "server sent GOAWAY and closed
+// the connection" after the server has received the stream. A graceful
+// shutdown GOAWAY means the server has not received it.
+func broadcastMayHaveLanded(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Go replaces the read error with this text once the server has received
+	// the stream. It is not a net.Error and does not unwrap to that read.
+	// Checked on the outer error so a *url.Error wrap is included.
+	if http2ServerClosedConnection(err) {
+		return true
+	}
+	// A dial timeout is still a dial: the signed transaction was not written.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var httpErr rpc.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode >= 500
+	}
+	// *url.Error implements net.Error, so it has to be judged by its cause
+	// before the net.Error check. A handshake failure would otherwise look
+	// like a broadcast that may have landed.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return broadcastMayHaveLanded(urlErr.Err)
+	}
+	// addTLS returns these before the request body is written. A later alert
+	// on a connection that already accepted bytes is wrapped by net/http.
+	if !transportConnectionBroken(err) && tlsFailedBeforeBody(err) {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// transportConnectionBroken reports net/http's wrap once a broken HTTP/1
+// connection may already have written the request.
+func transportConnectionBroken(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "net/http: HTTP/1.x transport connection broken")
+}
+
+// http2ServerClosedConnection reports Go's HTTP/2 error after the server has
+// received the stream and then sent GOAWAY. The graceful-shutdown text is a
+// different error: the server has not received the stream, and the HTTP/2
+// client retries that request itself.
+func http2ServerClosedConnection(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "http2: server sent GOAWAY and closed the connection")
+}
+
+// tlsFailedBeforeBody reports a TLS handshake timeout or alert. The timeout is
+// net/http's unexported net.Error with this string. crypto/tls reports an alert
+// as a net.OpError with Op "remote error" or "local error", often wrapped in
+// another net.Error.
+func tlsFailedBeforeBody(err error) bool {
+	for cur := err; cur != nil; {
+		if cur.Error() == "net/http: TLS handshake timeout" {
+			return true
+		}
+		next := errors.Unwrap(cur)
+		if next == nil || next == cur {
+			break
+		}
+		cur = next
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && (opErr.Op == "remote error" || opErr.Op == "local error")
 }
 
 func (c *TxSubmitter) prepareTransaction(

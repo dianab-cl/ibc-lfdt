@@ -74,8 +74,17 @@ type Config struct {
 	Relayer       RelayerConfig `yaml:"relayer"`
 	Attestors     Attestors     `yaml:"attestors"`
 	Signers       Signers       `yaml:"signers"`
+	MCP           MCPConfig     `yaml:"mcp,omitempty"`
 
 	originalFilePath string
+}
+
+// MCPConfig is the optional MCP server served by `ibc relayer run`.
+type MCPConfig struct {
+	// ListenAddr is a loopback host:port, such as "127.0.0.1:3001". Empty leaves the MCP server off.
+	ListenAddr string `yaml:"listenAddr,omitempty"`
+	// Append-only JSONL file of MCP writes. Empty uses mcp-audit.jsonl in the IBC home.
+	AuditLog string `yaml:"auditLog,omitempty"`
 }
 
 // ServerConfig config for RPC server for both relayer and attestor

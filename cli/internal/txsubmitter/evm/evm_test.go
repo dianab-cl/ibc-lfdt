@@ -4,7 +4,13 @@ package evm
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
 	"math/big"
+	"net"
+	"net/http"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 
@@ -333,6 +340,279 @@ func TestRestartRecoversUnknownGap(t *testing.T) {
 	expireNonce(restarted)
 	require.NoError(t, submit(t, restarted))
 	require.Equal(t, uint64(7), rpc.sent[1].Nonce())
+}
+
+func TestConfirmKeepsHashWhenBroadcastMayHaveLanded(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	rpc.send = func(*types.Transaction) error { return context.DeadlineExceeded }
+	hash, receipt, err := c.Confirm(t.Context(), testIntent(), 300*time.Millisecond)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Nil(t, receipt)
+	require.Equal(t, rpc.sent[0].Hash().Hex(), hash)
+	require.Equal(t, uint64(1), c.nextNonce, "a broadcast that may have landed reserves the nonce")
+
+	rpc.send = nil
+	rpc.receipt = &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: common.HexToHash(hash)}
+	next, _, err := c.Confirm(t.Context(), testIntent(), time.Second)
+	require.NoError(t, err)
+	require.NotEqual(t, hash, next)
+	require.Equal(t, uint64(1), rpc.sent[1].Nonce())
+}
+
+func TestConfirmRejectedBroadcastDoesNotReserveNonce(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	rejected := errors.New("transaction pool full")
+	rpc.send = func(*types.Transaction) error { return rejected }
+	hash, receipt, err := c.Confirm(t.Context(), testIntent(), time.Second)
+	require.ErrorIs(t, err, rejected)
+	require.Empty(t, hash)
+	require.Nil(t, receipt)
+	require.Zero(t, c.nextNonce)
+}
+
+func TestConfirmClassifiesBroadcastFailures(t *testing.T) {
+	dialRefused := &url.Error{
+		Op:  "Post",
+		URL: "http://127.0.0.1:8545",
+		Err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")},
+	}
+	dialTimeout := &url.Error{
+		Op:  "Post",
+		URL: "http://127.0.0.1:8545",
+		Err: &net.OpError{Op: "dial", Net: "tcp", Err: context.DeadlineExceeded},
+	}
+	readReset := &url.Error{
+		Op:  "Post",
+		URL: "http://127.0.0.1:8545",
+		Err: &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")},
+	}
+	writeTimeout := &url.Error{
+		Op:  "Post",
+		URL: "http://127.0.0.1:8545",
+		Err: &net.OpError{Op: "write", Net: "tcp", Err: errors.New("i/o timeout")},
+	}
+	// These fail before the signed transaction is written. *url.Error
+	// implements net.Error, so a blanket network check would reserve the nonce.
+	handshake := &url.Error{
+		Op:  "Post",
+		URL: "https://127.0.0.1:8545",
+		Err: tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"},
+	}
+	certificate := &url.Error{
+		Op:  "Post",
+		URL: "https://127.0.0.1:8545",
+		Err: errors.New("tls: failed to verify certificate: x509: certificate signed by unknown authority"),
+	}
+	// net/http's real handshake failures also implement net.Error. RecordHeaderError
+	// and a plain string do not, so they miss this path.
+	handshakeTimeout := netHTTPHandshakeTimeout(t)
+	remoteAlert := netHTTPTLSAlert(t)
+	localAlert := &url.Error{
+		Op:  "Post",
+		URL: "https://127.0.0.1:8545",
+		Err: &net.OpError{Op: "local error", Err: errors.New("tls: handshake failure")},
+	}
+	var remoteCause *url.Error
+	require.ErrorAs(t, remoteAlert, &remoteCause)
+	connectionBroken := &url.Error{
+		Op:  "Post",
+		URL: "https://127.0.0.1:8545",
+		Err: fmt.Errorf("net/http: HTTP/1.x transport connection broken: %w", remoteCause.Err),
+	}
+	// GoAwayError replaces the read after the server has received the stream.
+	// It is not a net.Error and does not unwrap to that read.
+	goAwayClosed := &url.Error{
+		Op:  "Post",
+		URL: "https://127.0.0.1:8545",
+		Err: errors.New(`http2: server sent GOAWAY and closed the connection; LastStreamID=1, ErrCode=0, debug=""`),
+	}
+	// The server has not received the stream. The HTTP/2 client retries this
+	// itself, so the nonce stays free.
+	goAwayGraceful := &url.Error{
+		Op:  "Post",
+		URL: "https://127.0.0.1:8545",
+		Err: errors.New("http2: Transport received Server's graceful shutdown GOAWAY"),
+	}
+	for _, tt := range []struct {
+		name     string
+		err      error
+		keepHash bool
+	}{
+		{name: "refused dial", err: dialRefused},
+		{name: "dial timeout", err: dialTimeout},
+		{name: "tls handshake", err: handshake},
+		{name: "tls handshake timeout", err: handshakeTimeout},
+		{name: "tls remote alert", err: remoteAlert},
+		{name: "tls local alert", err: localAlert},
+		{name: "certificate", err: certificate},
+		{name: "transport connection broken", err: connectionBroken, keepHash: true},
+		{name: "http2 goaway closed connection", err: goAwayClosed, keepHash: true},
+		{name: "http2 graceful shutdown goaway", err: goAwayGraceful},
+		{name: "deadline exceeded", err: context.DeadlineExceeded, keepHash: true},
+		{name: "read error", err: readReset, keepHash: true},
+		{name: "write error", err: writeTimeout, keepHash: true},
+		{name: "eof", err: io.EOF, keepHash: true},
+		{name: "http 500", err: rpc.HTTPError{StatusCode: 500, Status: "500 Internal Server Error"}, keepHash: true},
+		{name: "http 502", err: rpc.HTTPError{StatusCode: 502, Status: "502 Bad Gateway"}, keepHash: true},
+		{name: "http 504", err: rpc.HTTPError{StatusCode: 504, Status: "504 Gateway Timeout"}, keepHash: true},
+		{name: "http 400", err: rpc.HTTPError{StatusCode: 400, Status: "400 Bad Request"}},
+		{name: "http 429", err: rpc.HTTPError{StatusCode: 429, Status: "429 Too Many Requests"}},
+		{name: "nonce too low", err: errors.New("nonce too low")},
+		{name: "execution reverted", err: errors.New("execution reverted")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c, rpc := newSubmitter(t)
+			rpc.send = func(*types.Transaction) error { return tt.err }
+			timeout := time.Duration(0)
+			if tt.keepHash {
+				timeout = 30 * time.Millisecond
+			}
+			hash, receipt, err := c.Confirm(t.Context(), testIntent(), timeout)
+			require.Error(t, err)
+			require.Nil(t, receipt)
+			if !tt.keepHash {
+				require.Empty(t, hash)
+				require.Zero(t, c.nextNonce)
+				require.Empty(t, c.confirmReserved)
+				rpc.send = nil
+				require.NoError(t, submit(t, c))
+				require.Zero(t, rpc.sent[len(rpc.sent)-1].Nonce())
+				return
+			}
+			require.Equal(t, rpc.sent[0].Hash().Hex(), hash)
+			require.Equal(t, uint64(1), c.nextNonce)
+			_, reserved := c.confirmReserved[0]
+			require.True(t, reserved)
+		})
+	}
+}
+
+// netHTTPHandshakeTimeout is the error http.DefaultTransport returns when the
+// TLS handshake exceeds TLSHandshakeTimeout. The cause is unexported and
+// implements net.Error, and it is produced before the POST body is written.
+func netHTTPHandshakeTimeout(t *testing.T) error {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		<-done
+	}()
+	client := &http.Client{Transport: &http.Transport{
+		Proxy:               nil,
+		TLSHandshakeTimeout: 100 * time.Millisecond,
+	}}
+	resp, err := client.Get("https://" + ln.Addr().String())
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	require.Error(t, err)
+	var ue *url.Error
+	require.ErrorAs(t, err, &ue)
+	require.Equal(t, "net/http: TLS handshake timeout", ue.Err.Error())
+	var ne net.Error
+	require.ErrorAs(t, ue.Err, &ne)
+	require.True(t, ne.Timeout())
+	return err
+}
+
+// netHTTPTLSAlert is the error crypto/tls returns for a fatal handshake alert:
+// an unexported net.Error wrapping *net.OpError with Op "remote error".
+func netHTTPTLSAlert(t *testing.T) error {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 512)
+		_, _ = conn.Read(buf)
+		// TLS record: content-type alert, version TLS 1.2, fatal handshake_failure.
+		_, _ = conn.Write([]byte{0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28})
+		_, _ = conn.Read(buf)
+	}()
+	client := &http.Client{Transport: &http.Transport{
+		Proxy: nil,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		TLSHandshakeTimeout: 2 * time.Second,
+	}}
+	resp, err := client.Get("https://" + ln.Addr().String())
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	require.Error(t, err)
+	var ue *url.Error
+	require.ErrorAs(t, err, &ue)
+	var opErr *net.OpError
+	require.ErrorAs(t, ue.Err, &opErr)
+	require.Equal(t, "remote error", opErr.Op)
+	var ne net.Error
+	require.ErrorAs(t, ue.Err, &ne)
+	return err
+}
+
+func TestSubmitSkipsNonceReservedByConfirm(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		send func(*testRPC, *types.Transaction) error
+	}{
+		{name: "receipt times out"},
+		{
+			name: "broadcast may have landed",
+			send: func(rpc *testRPC, tx *types.Transaction) error {
+				rpc.pending = tx.Nonce() + 1
+				return context.DeadlineExceeded
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c, rpc := newSubmitter(t)
+			if tt.send != nil {
+				rpc.send = func(tx *types.Transaction) error { return tt.send(rpc, tx) }
+			}
+			hash, receipt, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond)
+			require.Error(t, err)
+			require.Nil(t, receipt)
+			require.Equal(t, rpc.sent[0].Hash().Hex(), hash)
+			require.Equal(t, uint64(1), c.nextNonce)
+			require.Equal(t, uint64(1), rpc.pending)
+
+			expireNonce(c)
+			rpc.send = nil
+			relay := testIntent()
+			relay.Data = []byte{9}
+			submission, err := c.Submit(t.Context(), relay)
+			require.NoError(t, err)
+			require.NotNil(t, submission)
+			require.Len(t, rpc.sent, 2)
+			require.Equal(t, uint64(0), rpc.sent[0].Nonce())
+			require.Equal(t, []byte{1}, rpc.sent[0].Data())
+			require.Equal(t, uint64(1), rpc.sent[1].Nonce())
+			require.Equal(t, []byte{9}, rpc.sent[1].Data())
+			_, reserved := c.confirmReserved[0]
+			require.True(t, reserved, "pending transfer keeps the Confirm reservation")
+
+			rpc.mined, rpc.pending = 0, 0
+			expireNonce(c)
+			require.NoError(t, submit(t, c))
+			require.Equal(t, uint64(0), rpc.sent[2].Nonce())
+			_, reserved = c.confirmReserved[0]
+			require.False(t, reserved)
+		})
+	}
 }
 
 func TestPreparationFailureDoesNotAllocateNonce(t *testing.T) {

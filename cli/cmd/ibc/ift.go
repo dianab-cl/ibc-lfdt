@@ -6,13 +6,11 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"math/big"
-	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -85,30 +83,23 @@ func txIFTMint(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	defer backend.Close()
 
 	to, err := resolveAddress(cfg, flagTxIFTTo)
 	if err != nil {
 		return err
 	}
 
-	contract, err := ift.NewContract(common.HexToAddress(flagTxIFTAddress), backend)
+	tx, receipt, err := callAndMine(
+		cmd.Context(), backend, key, chainID, common.HexToAddress(flagTxIFTAddress), 0,
+		func(c *ift.Contract, opts *bind.TransactOpts) (*types.Transaction, error) {
+			return c.Mint(opts, common.HexToAddress(to), amount)
+		},
+	)
 	if err != nil {
-		return err
-	}
-
-	opts, err := bind.NewKeyedTransactorWithChainID(key, chainID)
-	if err != nil {
-		return err
-	}
-	opts.Context = cmd.Context()
-
-	tx, err := contract.Mint(opts, common.HexToAddress(to), amount)
-	if err != nil {
-		return errors.Wrap(err, "mint")
-	}
-
-	receipt, err := bind.WaitMined(cmd.Context(), backend, tx)
-	if err != nil {
+		if tx == nil {
+			return errors.Wrap(err, "mint")
+		}
 		return errors.Wrap(err, "mint: wait mined")
 	}
 	if receipt.Status != types.ReceiptStatusSuccessful {
@@ -129,35 +120,28 @@ func txIFTSend(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	defer backend.Close()
 
 	receiver, err := resolveAddress(cfg, flagTxIFTTo)
 	if err != nil {
 		return err
 	}
 
-	contract, err := ift.NewContract(common.HexToAddress(flagTxIFTAddress), backend)
-	if err != nil {
-		return err
-	}
-
-	opts, err := bind.NewKeyedTransactorWithChainID(key, chainID)
-	if err != nil {
-		return err
-	}
-	opts.Context = cmd.Context()
-
 	if flagTxIFTTimeout <= 0 {
 		return errors.Errorf("invalid --timeout %s: must be positive", flagTxIFTTimeout)
 	}
 	timeout := uint64(time.Now().Add(flagTxIFTTimeout).Unix())
 
-	tx, err := contract.IftTransfer(opts, clientID, receiver, amount, timeout)
+	tx, receipt, err := callAndMine(
+		cmd.Context(), backend, key, chainID, common.HexToAddress(flagTxIFTAddress), 0,
+		func(c *ift.Contract, opts *bind.TransactOpts) (*types.Transaction, error) {
+			return c.IftTransfer(opts, clientID, receiver, amount, timeout)
+		},
+	)
 	if err != nil {
-		return errors.Wrapf(err, "iftTransfer %q", clientID)
-	}
-
-	receipt, err := bind.WaitMined(cmd.Context(), backend, tx)
-	if err != nil {
+		if tx == nil {
+			return errors.Wrapf(err, "iftTransfer %q", clientID)
+		}
 		return errors.Wrapf(err, "iftTransfer %q: wait mined", clientID)
 	}
 	if receipt.Status != types.ReceiptStatusSuccessful {
@@ -245,11 +229,7 @@ func dialIFTChain(ctx context.Context) (*ethclient.Client, *ecdsa.PrivateKey, *b
 		return nil, nil, nil, config.Config{}, errors.Errorf("chain %q is not an EVM chain", flagTxIFTChain)
 	}
 
-	keyHex, err := deployerKeyHex(cfg, flagTxIFTFrom)
-	if err != nil {
-		return nil, nil, nil, config.Config{}, err
-	}
-	key, err := crypto.HexToECDSA(strings.TrimPrefix(keyHex, "0x"))
+	key, err := localECDSAKey(cfg, flagTxIFTFrom)
 	if err != nil {
 		return nil, nil, nil, config.Config{}, errors.Wrap(err, "signer key")
 	}
