@@ -17,6 +17,7 @@ import (
 	"github.com/lfdt-ibc/ibc/cli/internal/config"
 	"github.com/lfdt-ibc/ibc/cli/internal/otel"
 	"github.com/lfdt-ibc/ibc/cli/internal/pkg/graceful"
+	"github.com/lfdt-ibc/ibc/cli/internal/server"
 )
 
 var (

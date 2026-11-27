@@ -10,7 +10,7 @@ import (
 
 	"connectrpc.com/connect"
 
-	"github.com/cosmos/ibc/cli/api/v2/relayer"
+	"github.com/lfdt-ibc/ibc/cli/api/v2/relayer"
 )
 
 // RelayerAPI adapts the relayer's RelayerApiService to RelayerBackend. Inside

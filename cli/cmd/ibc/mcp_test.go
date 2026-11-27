@@ -25,12 +25,12 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 
-	"github.com/cosmos/ibc/cli/api/v2/relayer"
-	"github.com/cosmos/ibc/cli/internal/config"
-	"github.com/cosmos/ibc/cli/internal/mcpserver"
-	"github.com/cosmos/ibc/cli/internal/service/signer"
-	"github.com/cosmos/ibc/cli/internal/txsubmitter"
-	evmsub "github.com/cosmos/ibc/cli/internal/txsubmitter/evm"
+	"github.com/lfdt-ibc/ibc/cli/api/v2/relayer"
+	"github.com/lfdt-ibc/ibc/cli/internal/config"
+	"github.com/lfdt-ibc/ibc/cli/internal/mcpserver"
+	"github.com/lfdt-ibc/ibc/cli/internal/service/signer"
+	"github.com/lfdt-ibc/ibc/cli/internal/txsubmitter"
+	evmsub "github.com/lfdt-ibc/ibc/cli/internal/txsubmitter/evm"
 )
 
 func TestStartRelayerMCP(t *testing.T) {

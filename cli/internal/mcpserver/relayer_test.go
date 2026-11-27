@@ -12,7 +12,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/stretchr/testify/require"
 
-	"github.com/cosmos/ibc/cli/api/v2/relayer"
+	"github.com/lfdt-ibc/ibc/cli/api/v2/relayer"
 )
 
 type stubRelayerService struct {

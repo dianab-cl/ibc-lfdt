@@ -9,7 +9,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/cosmos/ibc/cli/internal/otel"
+	"github.com/lfdt-ibc/ibc/cli/internal/otel"
 )
 
 // methodToolsCall is the MCP method for a tool call. The SDK constant is unexported.

@@ -18,8 +18,8 @@ require (
 	github.com/goccy/go-yaml v1.19.2
 	github.com/google/jsonschema-go v0.4.3
 	github.com/jackc/pgx/v5 v5.12.0
-	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/lfdt-ibc/ibc/gen/go/solidity-abi v0.0.0
+	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/pkg/errors v0.9.1
 	github.com/rubenv/sql-migrate v1.8.1
 	github.com/spf13/cobra v1.10.2

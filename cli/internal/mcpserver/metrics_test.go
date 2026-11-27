@@ -13,7 +13,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
-	"github.com/cosmos/ibc/cli/internal/otel"
+	"github.com/lfdt-ibc/ibc/cli/internal/otel"
 )
 
 func TestToolCallMetrics(t *testing.T) {

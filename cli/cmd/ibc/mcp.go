@@ -21,14 +21,14 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/cosmos/ibc-contracts/packages/go-abigen/ift"
-	"github.com/cosmos/ibc/cli/api/v2/relayer"
-	"github.com/cosmos/ibc/cli/internal/config"
-	"github.com/cosmos/ibc/cli/internal/mcpserver"
-	"github.com/cosmos/ibc/cli/internal/otel"
-	"github.com/cosmos/ibc/cli/internal/service/signer"
-	"github.com/cosmos/ibc/cli/internal/txsubmitter"
-	evmsub "github.com/cosmos/ibc/cli/internal/txsubmitter/evm"
-	v2 "github.com/cosmos/ibc/cli/internal/types/v2"
+	"github.com/lfdt-ibc/ibc/cli/api/v2/relayer"
+	"github.com/lfdt-ibc/ibc/cli/internal/config"
+	"github.com/lfdt-ibc/ibc/cli/internal/mcpserver"
+	"github.com/lfdt-ibc/ibc/cli/internal/otel"
+	"github.com/lfdt-ibc/ibc/cli/internal/service/signer"
+	"github.com/lfdt-ibc/ibc/cli/internal/txsubmitter"
+	evmsub "github.com/lfdt-ibc/ibc/cli/internal/txsubmitter/evm"
+	v2 "github.com/lfdt-ibc/ibc/cli/internal/types/v2"
 )
 
 // flags of `ibc relayer run` that start the MCP server beside the relayer

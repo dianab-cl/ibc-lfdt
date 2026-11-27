@@ -17,7 +17,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/cosmos/ibc-contracts/packages/go-abigen/ift"
-	"github.com/cosmos/ibc/cli/internal/config"
+	"github.com/lfdt-ibc/ibc/cli/internal/config"
 )
 
 // localECDSAKey loads a configured local ECDSA signer. Remote signers are refused.
