@@ -103,6 +103,10 @@ func (s *Server) waitForPackets(
 	result := func(done, timedOut bool, next NextStep) (*mcp.CallToolResult, WaitOutput, error) {
 		out := waitResult(packets, done, timedOut, start)
 		out.Next = next.at(&TxRef{ChainID: in.ChainID, TxHash: used})
+		// A follow-up wait keeps this wait's goal; final is the default.
+		if out.Next.Tool == toolWait && until != untilFinal {
+			out.Next.Arguments["until"] = until
+		}
 		if note := replacedNote(in.TxHash, used); note != "" {
 			out.Next.Reason = note + " " + out.Next.Reason
 		}
@@ -128,6 +132,10 @@ func (s *Server) waitForPackets(
 		got, gotHash, err := s.txPackets(waitCtx, in.ChainID, in.TxHash)
 		if err == nil {
 			packets, used, lastErr = got, gotHash, nil
+			if len(packets) > 0 {
+				// Packets exist only once the source tx mined.
+				s.noteMinedLate(s.replaced.family(in.TxHash), TxRef{ChainID: in.ChainID, TxHash: used})
+			}
 			notifier.changes(ctx, seen, packets, until)
 			if len(packets) > 0 && allReached(packets, until) {
 				return result(true, false, NextStep{Reason: waitDoneHint})

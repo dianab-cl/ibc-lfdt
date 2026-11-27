@@ -96,6 +96,10 @@ func (s *Server) relayTx(
 		packets = []ObservedPacket{}
 	}
 	out := RelayOutput{Packets: packets, Next: relayNext(packets).at(&TxRef{ChainID: in.ChainID, TxHash: used})}
+	if len(packets) > 0 {
+		// Packets exist only once the source tx mined.
+		s.noteMinedLate(s.replaced.family(in.TxHash), TxRef{ChainID: in.ChainID, TxHash: used})
+	}
 	s.sends.relayed(s.replaced.family(in.TxHash), out.Next)
 	if note := replacedNote(in.TxHash, used); note != "" {
 		out.Warnings = append(out.Warnings, note)

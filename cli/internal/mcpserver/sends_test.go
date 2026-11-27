@@ -4,6 +4,7 @@ package mcpserver
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -230,4 +231,67 @@ func TestConfiguredTokens(t *testing.T) {
 	_, terr = h.call("ibc_ift_balance", map[string]any{"chain_id": chainB, "address": agentKey}, nil)
 	require.Equal(t, CodeInvalidArgument, terr.Code)
 	require.Contains(t, terr.Message, "has 0 configured tokens")
+}
+
+// A TX_NOT_CONFIRMED send that mines later is listed as mined once its packets
+// are seen, by ibc_relay_tx or by ibc_wait_for_packets, and its audit id gets a
+// mined line.
+func TestNotConfirmedSendIsMinedOnceItsPacketsAreSeen(t *testing.T) {
+	for _, seenBy := range []string{toolRelay, toolWait} {
+		t.Run(seenBy, func(t *testing.T) {
+			auditPath := t.TempDir() + "/audit.jsonl"
+			audit, err := OpenAuditLog(auditPath)
+			require.NoError(t, err)
+			chain := &fakeChain{sendErr: NewTxError(CodeTxNotConfirmed, TxRef{ChainID: chainA, TxHash: txHash}, "not mined")}
+			rel := &fakeRelayer{
+				relayPackets: []ObservedPacket{{SourceClientID: "base-0", Sequence: "42", Selection: SelectionSelected}},
+				script:       [][]PacketStatus{{packet(StatePending, false)}},
+			}
+			srv, err := New(chain, rel, Options{Audit: audit, PollInterval: 10 * time.Millisecond})
+			require.NoError(t, err)
+			srv.skipConfirmation = true
+			t.Cleanup(func() { _ = srv.Close() })
+
+			in := SendInput{ChainID: chainA, IFT: tokenA, ClientID: "base-0", To: bobHex, Amount: "100"}
+			_, _, err = srv.iftSend(context.Background(), &mcp.CallToolRequest{}, in)
+			requireCode(t, err, CodeTxNotConfirmed)
+			require.Equal(t, sendFailed, listSends(t, srv)[0].Status)
+
+			if seenBy == toolRelay {
+				_, _, err = srv.relayTx(context.Background(), &mcp.CallToolRequest{}, RelayInput{ChainID: chainA, TxHash: txHash})
+			} else {
+				_, _, err = srv.waitForPackets(context.Background(), &mcp.CallToolRequest{},
+					WaitInput{ChainID: chainA, TxHash: txHash, TimeoutSeconds: 1})
+			}
+			require.NoError(t, err)
+
+			got := listSends(t, srv)[0]
+			require.Equal(t, sendMined, got.Status)
+			require.Nil(t, got.Error)
+			require.Equal(t, txHash, got.Tx.TxHash)
+			require.Contains(t, got.Warnings[len(got.Warnings)-1], "mined later")
+			require.Equal(t, seenBy == toolRelay, got.RelayRequested)
+
+			bz, err := os.ReadFile(auditPath)
+			require.NoError(t, err)
+			require.Contains(t, string(bz), `"id":"`+got.ID+`","tool":"ibc_ift_send","outcome":"mined"`)
+		})
+	}
+}
+
+// A follow-up wait keeps until=received rather than falling back to final.
+func TestWaitNextKeepsUntil(t *testing.T) {
+	rel := &fakeRelayer{script: [][]PacketStatus{{packet(StatePending, false)}}}
+	srv := newSendServer(t, &fakeChain{}, rel)
+	_, out, err := srv.waitForPackets(context.Background(), &mcp.CallToolRequest{},
+		WaitInput{ChainID: chainA, TxHash: txHash, Until: untilReceived, TimeoutSeconds: 1})
+	require.NoError(t, err)
+	require.True(t, out.TimedOut)
+	require.Equal(t, toolWait, out.Next.Tool)
+	require.Equal(t, untilReceived, out.Next.Arguments["until"])
+
+	_, out, err = srv.waitForPackets(context.Background(), &mcp.CallToolRequest{},
+		WaitInput{ChainID: chainA, TxHash: txHash, TimeoutSeconds: 1})
+	require.NoError(t, err)
+	require.NotContains(t, out.Next.Arguments, "until", "final is the default")
 }

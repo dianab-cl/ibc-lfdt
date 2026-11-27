@@ -63,7 +63,11 @@ next. A write that reached the chain always carries its `tx`.
 
 A send that fails after `ibc_ift_send` returned shows its error in `ibc_list_sends`, and
 `ibc_wait_for_packets` returns it while the transfer has no packets. `TX_NOT_CONFIRMED` is the
-exception: that tx may mine later, so `next` asks for `ibc_relay_tx` instead.
+exception: that tx may mine later, so `next` asks for `ibc_relay_tx` instead. Once
+`ibc_relay_tx` or `ibc_wait_for_packets` sees its packets, the send is listed as `mined` with a
+warning, and the audit log gets a `mined` line under its `id`.
+
+A wait's `next` keeps its `until`, so a follow-up wait has the same goal.
 
 If a `TX_NOT_CONFIRMED` transfer is still pending after the relayer's pending-transaction
 timeout, the relayer re-signs it at the same nonce with higher fees, so a different hash can be
@@ -148,7 +152,8 @@ the relayer spends its own gas to deliver. Reads stay open on every chain in `ib
 
 Every `ibc_ift_send` and `ibc_relay_tx` call is appended to the audit log before it is submitted,
 and a second line records how it ended (`mined`, `not_confirmed`, `reverted`, `relayed`, or
-`failed`). A send the relayer later re-signs gets a `replaced` line with the new hash. The relay that `ibc_ift_send` requests after mining belongs to that send: it has no
+`failed`). A send the relayer later re-signs gets a `replaced` line with the new hash. A
+`not_confirmed` send whose packets are later seen gets a `mined` line. The relay that `ibc_ift_send` requests after mining belongs to that send: it has no
 line of its own, and the send's `mined` line does not record whether the relay request
 succeeded. The send's warnings in `ibc_list_sends` carry that. A call refused before submission is one
 line: `denied` for a policy refusal, `declined` when the user declines, and `failed` for an
@@ -199,7 +204,10 @@ file is a few dozen bytes.
 - `server.go`: server setup, middleware and tool registration
 - `context.go`: `ibc_get_context`
 - `balance.go`: `ibc_ift_balance`, token metadata and amount formatting
-- `sends.go`: `ibc_ift_send`, write authorization, this run's sends and `ibc_list_sends`
+- `iftsend.go`: `ibc_ift_send`, the send that continues after it returns, and its relay request
+- `authorize.go`: the checks a send must pass (token, amount, client, signer, receiver), then
+  the request for the user's approval
+- `sends.go`: this run's sends and `ibc_list_sends`
 - `packets.go`: `ibc_relay_tx`, `ibc_get_packets` and the packets resource
 - `audit.go`: append-only JSONL audit log
 - `wait.go`: `ibc_wait_for_packets` and progress
