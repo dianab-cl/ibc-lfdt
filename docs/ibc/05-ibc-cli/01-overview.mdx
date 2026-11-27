@@ -158,7 +158,7 @@ It has nine blocks:
 - `signers`: the keys, each under an alias the other blocks reference by name.
 - `server` and `db`: the address to listen on, and the relayer's database.
 - `logging` and `observability`: the log level and format, and the metrics endpoint.
-- `mcp`: optional loopback address for an MCP server inside `ibc relayer run`. Omit it, or leave `listenAddr` empty, and the relayer runs without MCP. The server is an API over that relayer: it does not mint and it does not cap amounts. While it is on, sends and relays are appended to `mcp.auditLog`, or to `mcp-audit.jsonl` in the IBC home when that key is empty.
+- `mcp`: optional loopback address for an MCP server inside `ibc relayer run`. Omit it, or leave `listenAddr` empty, and the relayer runs without MCP. The server is an API over that relayer: it does not mint and it does not cap amounts. Clients must send the bearer token in `mcp.tokenFile`, or in `mcp-token` in the IBC home when that key is empty; the file is created on first start. While it is on, sends and relays are appended to `mcp.auditLog`, or to `mcp-audit.jsonl` in the IBC home when that key is empty.
 
 Most configurations can be generated. `ibc config new` writes a starting file, `config add-chain` appends a chain, and the `ibc keys` commands can append a signer. After deploying, `ibc deploy render-config` prints the complete config with deployment settings merged in. Add `--populate-config` to save it.
 

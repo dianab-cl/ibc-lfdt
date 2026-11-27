@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,10 +44,14 @@ type testRPC struct {
 	gasCalls       int
 	gas            uint64
 	gasErr         error
-	callOutput     []byte
-	nonceErr       error
-	receipt        *types.Receipt
-	receiptErr     error
+	// gasErrFor, when set, fails estimation per call.
+	gasErrFor  func(ethereum.CallMsg) error
+	callOutput []byte
+	nonceErr   error
+	receipt    *types.Receipt
+	receiptErr error
+	// receiptFor, when set, answers TransactionReceipt per hash.
+	receiptFor func(common.Hash) (*types.Receipt, error)
 }
 
 func (r *testRPC) BalanceAt(context.Context, common.Address, *big.Int) (*big.Int, error) {
@@ -75,10 +80,15 @@ func (r *testRPC) CallContract(context.Context, ethereum.CallMsg, *big.Int) ([]b
 	return nil, errors.New("unexpected call")
 }
 
-func (r *testRPC) EstimateGasAtBlock(_ context.Context, _ ethereum.CallMsg, block *big.Int) (uint64, error) {
+func (r *testRPC) EstimateGasAtBlock(_ context.Context, msg ethereum.CallMsg, block *big.Int) (uint64, error) {
 	r.gasCalls++
 	if block != nil {
 		return 0, errors.New("expected mined state")
+	}
+	if r.gasErrFor != nil {
+		if err := r.gasErrFor(msg); err != nil {
+			return 0, err
+		}
 	}
 	return r.gas, r.gasErr
 }
@@ -94,7 +104,10 @@ func (r *testRPC) PendingNonceAt(context.Context, common.Address) (uint64, error
 	return r.pending, nil
 }
 
-func (r *testRPC) TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error) {
+func (r *testRPC) TransactionReceipt(_ context.Context, hash common.Hash) (*types.Receipt, error) {
+	if r.receiptFor != nil {
+		return r.receiptFor(hash)
+	}
 	if r.receipt != nil || r.receiptErr != nil {
 		return r.receipt, r.receiptErr
 	}
@@ -345,7 +358,7 @@ func TestRestartRecoversUnknownGap(t *testing.T) {
 func TestConfirmKeepsHashWhenBroadcastMayHaveLanded(t *testing.T) {
 	c, rpc := newSubmitter(t)
 	rpc.send = func(*types.Transaction) error { return context.DeadlineExceeded }
-	hash, receipt, err := c.Confirm(t.Context(), testIntent(), 300*time.Millisecond)
+	hash, receipt, err := c.Confirm(t.Context(), testIntent(), 300*time.Millisecond, nil)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Nil(t, receipt)
 	require.Equal(t, rpc.sent[0].Hash().Hex(), hash)
@@ -353,7 +366,7 @@ func TestConfirmKeepsHashWhenBroadcastMayHaveLanded(t *testing.T) {
 
 	rpc.send = nil
 	rpc.receipt = &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: common.HexToHash(hash)}
-	next, _, err := c.Confirm(t.Context(), testIntent(), time.Second)
+	next, _, err := c.Confirm(t.Context(), testIntent(), time.Second, nil)
 	require.NoError(t, err)
 	require.NotEqual(t, hash, next)
 	require.Equal(t, uint64(1), rpc.sent[1].Nonce())
@@ -363,7 +376,7 @@ func TestConfirmRejectedBroadcastDoesNotReserveNonce(t *testing.T) {
 	c, rpc := newSubmitter(t)
 	rejected := errors.New("transaction pool full")
 	rpc.send = func(*types.Transaction) error { return rejected }
-	hash, receipt, err := c.Confirm(t.Context(), testIntent(), time.Second)
+	hash, receipt, err := c.Confirm(t.Context(), testIntent(), time.Second, nil)
 	require.ErrorIs(t, err, rejected)
 	require.Empty(t, hash)
 	require.Nil(t, receipt)
@@ -467,7 +480,7 @@ func TestConfirmClassifiesBroadcastFailures(t *testing.T) {
 			if tt.keepHash {
 				timeout = 30 * time.Millisecond
 			}
-			hash, receipt, err := c.Confirm(t.Context(), testIntent(), timeout)
+			hash, receipt, err := c.Confirm(t.Context(), testIntent(), timeout, nil)
 			require.Error(t, err)
 			require.Nil(t, receipt)
 			if !tt.keepHash {
@@ -564,7 +577,7 @@ func netHTTPTLSAlert(t *testing.T) error {
 	return err
 }
 
-func TestSubmitSkipsNonceReservedByConfirm(t *testing.T) {
+func TestSubmitReplacesStalledConfirmTransfer(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		send func(*testRPC, *types.Transaction) error
@@ -583,36 +596,162 @@ func TestSubmitSkipsNonceReservedByConfirm(t *testing.T) {
 			if tt.send != nil {
 				rpc.send = func(tx *types.Transaction) error { return tt.send(rpc, tx) }
 			}
-			hash, receipt, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond)
+			hash, receipt, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil)
 			require.Error(t, err)
 			require.Nil(t, receipt)
 			require.Equal(t, rpc.sent[0].Hash().Hex(), hash)
 			require.Equal(t, uint64(1), c.nextNonce)
 			require.Equal(t, uint64(1), rpc.pending)
 
-			expireNonce(c)
+			// Before the stall timeout the transfer keeps its nonce.
 			rpc.send = nil
 			relay := testIntent()
 			relay.Data = []byte{9}
-			submission, err := c.Submit(t.Context(), relay)
-			require.NoError(t, err)
-			require.NotNil(t, submission)
+			require.NoError(t, submitIntent(t, c, relay))
 			require.Len(t, rpc.sent, 2)
-			require.Equal(t, uint64(0), rpc.sent[0].Nonce())
-			require.Equal(t, []byte{1}, rpc.sent[0].Data())
 			require.Equal(t, uint64(1), rpc.sent[1].Nonce())
-			require.Equal(t, []byte{9}, rpc.sent[1].Data())
-			_, reserved := c.confirmReserved[0]
-			require.True(t, reserved, "pending transfer keeps the Confirm reservation")
 
+			// After it, the transfer is re-signed at its nonce with higher fees
+			// and the relay intent still gets the next nonce.
+			expireNonce(c)
+			require.NoError(t, submitIntent(t, c, relay))
+			require.Len(t, rpc.sent, 4)
+			replacement := rpc.sent[2]
+			require.Equal(t, uint64(0), replacement.Nonce())
+			require.Equal(t, []byte{1}, replacement.Data())
+			require.Equal(t, 1, replacement.GasFeeCap().Cmp(rpc.sent[0].GasFeeCap()))
+			require.Equal(t, 1, replacement.GasTipCap().Cmp(rpc.sent[0].GasTipCap()))
+			require.Equal(t, uint64(2), rpc.sent[3].Nonce())
+			require.Equal(t, []byte{9}, rpc.sent[3].Data())
+			r, reserved := c.confirmReserved[0]
+			require.True(t, reserved, "pending transfer keeps the Confirm reservation")
+			require.Equal(t, []string{hash, replacement.Hash().Hex()}, r.hashes)
+
+			// A node that no longer has the transfer frees the nonce.
 			rpc.mined, rpc.pending = 0, 0
 			expireNonce(c)
-			require.NoError(t, submit(t, c))
-			require.Equal(t, uint64(0), rpc.sent[2].Nonce())
+			require.NoError(t, submitIntent(t, c, relay))
+			require.Equal(t, uint64(0), rpc.sent[4].Nonce())
+			require.Equal(t, []byte{9}, rpc.sent[4].Data())
 			_, reserved = c.confirmReserved[0]
 			require.False(t, reserved)
 		})
 	}
+}
+
+func TestConfirmReportsMinedReplacement(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	replaced := make(chan [2]string, 1)
+	first, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, func(previous, replacement string) {
+		replaced <- [2]string{previous, replacement}
+	})
+	require.Error(t, err)
+	// Confirm's wait holds this pointer, not a lookup by nonce.
+	reserved := c.confirmReserved[0]
+	require.NotNil(t, reserved)
+
+	expireNonce(c)
+	require.NoError(t, submit(t, c))
+	replacement := rpc.sent[1].Hash()
+	require.Equal(t, []byte{1}, rpc.sent[1].Data())
+	require.Equal(t, uint64(0), rpc.sent[1].Nonce())
+	// Confirm has returned; the caller still hears about the new hash.
+	select {
+	case got := <-replaced:
+		require.Equal(t, [2]string{first, replacement.Hex()}, got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement not reported")
+	}
+
+	// The replacement is mined, and the next submission drops the map entry
+	// before the wait polls again.
+	rpc.mined = 1
+	require.NoError(t, submit(t, c))
+	require.Empty(t, c.confirmReserved)
+	for _, h := range []string{first, replacement.Hex()} {
+		require.False(t, trackedTx(c.chainID, h), "a dropped reservation leaves no gas-metrics entry for %s", h)
+	}
+
+	rpc.receiptFor = func(hash common.Hash) (*types.Receipt, error) {
+		if hash == replacement {
+			return &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: hash}, nil
+		}
+		return nil, ethereum.NotFound
+	}
+	mined, receipt, err := c.waitReceipt(t.Context(), reserved, first)
+	require.NoError(t, err)
+	require.NotNil(t, receipt)
+	require.Equal(t, replacement.Hex(), mined)
+
+	// A wait that times out reports the latest signed hash.
+	rpc.receiptFor = func(common.Hash) (*types.Receipt, error) { return nil, ethereum.NotFound }
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel()
+	latest, receipt, err := c.waitReceipt(ctx, reserved, first)
+	require.ErrorIs(t, err, ethereum.NotFound)
+	require.Nil(t, receipt)
+	require.Equal(t, replacement.Hex(), latest)
+
+	// Without a reservation only the first hash is polled.
+	ctx2, cancel2 := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel2()
+	latest, _, err = c.waitReceipt(ctx2, nil, first)
+	require.Error(t, err)
+	require.Equal(t, first, latest)
+}
+
+func TestFailedStallReplacementRestartsTimer(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	_, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil)
+	require.Error(t, err)
+
+	expireNonce(c)
+	rpc.send = func(tx *types.Transaction) error {
+		if tx.Nonce() == 0 {
+			return errors.New("transaction pool full")
+		}
+		rpc.pending = max(rpc.pending, tx.Nonce()+1)
+		return nil
+	}
+	require.NoError(t, submit(t, c))
+	require.Len(t, rpc.sent, 3)
+	require.Equal(t, uint64(0), rpc.sent[1].Nonce(), "the replacement was attempted")
+	require.Equal(t, uint64(1), rpc.sent[2].Nonce(), "a failed replacement does not block the next intent")
+	require.False(t, c.lowestUnminedNoncePendingSince.Before(time.Now().Add(-time.Second)))
+	_, reserved := c.confirmReserved[0]
+	require.True(t, reserved)
+}
+
+func TestRevertingStallReplacementFreesNonce(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	_, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil)
+	require.Error(t, err)
+	require.Equal(t, uint64(1), rpc.pending)
+
+	// The transfer would now revert, for example because the balance moved.
+	rpc.gasErrFor = func(msg ethereum.CallMsg) error {
+		if len(msg.Data) == 1 && msg.Data[0] == 1 {
+			return rpcCodeError{code: 3, msg: "execution reverted: insufficient balance"}
+		}
+		return nil
+	}
+	expireNonce(c)
+	relay := testIntent()
+	relay.Data = []byte{9}
+	require.NoError(t, submitIntent(t, c, relay))
+	require.Len(t, rpc.sent, 2)
+	require.Equal(t, uint64(0), rpc.sent[1].Nonce(), "the relay replaces the transfer that would revert")
+	require.Equal(t, []byte{9}, rpc.sent[1].Data())
+	require.Empty(t, c.confirmReserved)
+}
+
+func submitIntent(t *testing.T, c *TxSubmitter, intent v2.TxIntent) error {
+	t.Helper()
+	submission, err := c.Submit(t.Context(), intent)
+	if err == nil {
+		require.NotNil(t, submission)
+	}
+	return err
 }
 
 func TestPreparationFailureDoesNotAllocateNonce(t *testing.T) {
@@ -877,7 +1016,102 @@ func TestSubmitRejectsEstimationRevert(t *testing.T) {
 	result, err := submitter.Submit(t.Context(), testIntent())
 	require.Nil(t, result)
 	require.ErrorIs(t, err, revert)
+	require.ErrorIs(t, err, ErrEstimationReverted)
 	require.EqualError(t, err, "estimating gas: ConsensusStateExpired(100, 121, 20): execution reverted")
 	require.Empty(t, eth.sent)
 	require.Zero(t, submitter.nextNonce)
+}
+
+func TestEstimationRevertClassification(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		err      error
+		reverted bool
+	}{
+		{name: "geth revert code 3", err: rpcCodeError{code: 3, msg: "execution reverted: insufficient balance"}, reverted: true},
+		{name: "besu revert -32000", err: rpcCodeError{code: -32000, msg: "Execution reverted"}, reverted: true},
+		{name: "node failure -32000", err: rpcCodeError{code: -32000, msg: "header not found"}},
+		{name: "transport", err: context.DeadlineExceeded},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c, rpc := newSubmitter(t)
+			rpc.gasErr = tt.err
+			hash, _, err := c.Confirm(t.Context(), testIntent(), 0, nil)
+			require.Empty(t, hash)
+			require.ErrorIs(t, err, tt.err)
+			require.Equal(t, tt.reverted, errors.Is(err, ErrEstimationReverted))
+			require.Empty(t, rpc.sent)
+		})
+	}
+}
+
+type rpcCodeError struct {
+	code int
+	msg  string
+}
+
+func (e rpcCodeError) Error() string  { return e.msg }
+func (e rpcCodeError) ErrorCode() int { return e.code }
+
+// trackedTx reports whether the gas metrics still hold txHash.
+func trackedTx(chainID, txHash string) bool {
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	_, ok := metrics.txOwners[transactionKey{chainID: chainID, txHash: txHash}]
+	return ok
+}
+
+func TestConfirmCountsGasWhenReservationDroppedDuringWait(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	polled := make(chan struct{}, 1)
+	var mined atomic.Bool
+	rpc.receiptFor = func(h common.Hash) (*types.Receipt, error) {
+		select {
+		case polled <- struct{}{}:
+		default:
+		}
+		if mined.Load() {
+			return &types.Receipt{
+				Status: types.ReceiptStatusSuccessful, TxHash: h, GasUsed: 21_000, EffectiveGasPrice: big.NewInt(7),
+			}, nil
+		}
+		return nil, ethereum.NotFound
+	}
+	before := walletCost(c)
+
+	type result struct {
+		hash    string
+		receipt *types.Receipt
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		hash, receipt, err := c.Confirm(t.Context(), testIntent(), 10*time.Second, nil)
+		done <- result{hash, receipt, err}
+	}()
+	<-polled // Confirm broadcast and is waiting for the receipt.
+
+	// The transfer is mined, and a relayer submission drops the reservation
+	// before Confirm's next poll.
+	rpc.mined = 1
+	require.NoError(t, submit(t, c))
+	c.mu.Lock()
+	require.Empty(t, c.confirmReserved)
+	c.mu.Unlock()
+	mined.Store(true)
+
+	res := <-done
+	require.NoError(t, res.err)
+	require.NotNil(t, res.receipt)
+	require.Equal(t, big.NewInt(21_000*7), new(big.Int).Sub(walletCost(c), before),
+		"a receipt seen within the wait is counted")
+	require.False(t, trackedTx(c.chainID, res.hash))
+}
+
+// walletCost is the cumulative gas cost the metrics hold for c's wallet.
+func walletCost(c *TxSubmitter) *big.Int {
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	w := metrics.wallets[chainWallet{chainID: c.chainID, wallet: c.address.Hex()}]
+	return new(big.Int).Set(w.cumulativeGasCostWei)
 }

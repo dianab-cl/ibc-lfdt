@@ -9,11 +9,13 @@ import (
 	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/metric"
 )
 
 const (
@@ -154,6 +156,8 @@ type harness struct {
 type clientOpts struct {
 	elicit          func(*mcp.ElicitParams) (*mcp.ElicitResult, error)
 	protocolVersion string
+	// meter, when set, counts tool calls on the server.
+	meter metric.Meter
 }
 
 func newHarness(t *testing.T, co clientOpts) *harness {
@@ -176,9 +180,10 @@ func (h *harness) start(co clientOpts, skipConfirmation bool) {
 	srv, err := New(
 		h.chain,
 		h.relayer,
-		Options{PollInterval: 10 * time.Millisecond, SkipConfirmation: skipConfirmation},
+		Options{PollInterval: 10 * time.Millisecond, Meter: co.meter},
 	)
 	require.NoError(t, err)
+	srv.skipConfirmation = skipConfirmation
 	h.srv = srv
 
 	copts := &mcp.ClientOptions{
@@ -352,10 +357,18 @@ func TestSendPolicyDenials(t *testing.T) {
 		code   ErrorCode
 		msg    string
 	}{
-		"signer":  {func(a map[string]any) { a["from"] = "relayer-key" }, CodePolicyDenied, "not configured on client"},
-		"client":  {func(a map[string]any) { a["chain_id"] = chainB }, CodePolicyDenied, "not on this relayer"},
-		"amount":  {func(a map[string]any) { a["amount"] = "1.5" }, CodeInvalidArgument, "positive integer"},
-		"zero":    {func(a map[string]any) { a["amount"] = "0" }, CodeInvalidArgument, "positive integer"},
+		"signer": {func(a map[string]any) { a["from"] = "relayer-key" }, CodePolicyDenied, "not configured on client"},
+		"client": {func(a map[string]any) { a["chain_id"] = chainB }, CodePolicyDenied, "not on this relayer"},
+		"amount": {func(a map[string]any) { a["amount"] = "1.5" }, CodeInvalidArgument, "positive integer"},
+		"zero":   {func(a map[string]any) { a["amount"] = "0" }, CodeInvalidArgument, "positive integer"},
+		// 2^256 + 5 would pack as 5.
+		"uint256 overflow": {func(a map[string]any) {
+			a["amount"] = "115792089237316195423570985008687907853269984665640564039457584007913129639941"
+		}, CodeInvalidArgument, "at most 2^256-1"},
+		"uint256 max is not refused as an amount": {func(a map[string]any) {
+			a["amount"] = "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+			a["from"] = "relayer-key"
+		}, CodePolicyDenied, "not configured on client"},
 		"relay":   {func(a map[string]any) { a["relay"] = "sometimes" }, "", "enum"},
 		"timeout": {func(a map[string]any) { a["timeout_seconds"] = 5 }, "", "minimum"},
 	}
@@ -651,6 +664,50 @@ func TestConfirmationsExpire(t *testing.T) {
 	now = now.Add(-confirmStateTTL - time.Second)
 	require.Equal(t, confirmAccepted, c.redeem(state, "a", "b"))
 	require.Equal(t, confirmUsed, c.redeem(state, "a", "b"))
+
+	// A spent token stays used after it expires, until spentRetention passes.
+	now = now.Add(confirmStateTTL + time.Second)
+	require.Equal(t, confirmUsed, c.redeem(state, "a", "b"))
+	now = now.Add(spentRetention - 2*time.Second)
+	require.Equal(t, confirmUsed, c.redeem(state, "a", "b"))
+	now = now.Add(2 * time.Second)
+	require.Equal(t, confirmStale, c.redeem(state, "a", "b"))
+	require.Empty(t, c.used, "records past retention are dropped")
+
+	// An unspent token past retention is stale too: it cannot be told apart.
+	fresh := c.issue("a", "b")
+	now = now.Add(confirmStateTTL + spentRetention + time.Second)
+	require.Equal(t, confirmStale, c.redeem(fresh, "a", "b"))
+
+	// A token from before a restart cannot be checked, used or not.
+	restarted := newConfirmations(func() time.Time { return now })
+	earlier := c.issue("a", "b")
+	require.Equal(t, confirmOtherRun, restarted.redeem(earlier, "a", "b"))
+	require.Equal(t, confirmMismatch, restarted.redeem("a.b.c", "a", "b"))
+}
+
+func TestApprovalFromBeforeRestartAsksTheUser(t *testing.T) {
+	h := newConfirmingHarness(t, clientOpts{})
+	fields := []string{
+		"Send", chainA, strings.ToLower(tokenA), agentKey, strings.ToLower(bobHex),
+		"100", "base-0", defaultSendTimeout.String(), relayAuto,
+	}
+	earlier := newConfirmations(time.Now).issue(fields...)
+	in := SendInput{ChainID: chainA, IFT: tokenA, ClientID: "base-0", To: bobHex, Amount: "100", From: agentKey}
+	req := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{
+		RequestState: earlier,
+		InputResponses: mcp.InputResponseMap{
+			confirmInputKey: &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approve": true}},
+		},
+	}}
+	_, _, err := h.srv.iftSend(context.Background(), req, in)
+	var te *ToolError
+	require.ErrorAs(t, err, &te)
+	require.Equal(t, CodePolicyDenied, te.Code)
+	require.Contains(t, te.Message, "restarted")
+	require.Contains(t, te.Message, "Ask the user")
+	require.NotContains(t, te.Message, "call the tool again")
+	require.Zero(t, h.chain.sendCount())
 }
 
 func TestExpiredConfirmationSaysCallAgain(t *testing.T) {
@@ -705,6 +762,24 @@ func TestExpiredConfirmationSaysCallAgain(t *testing.T) {
 	require.NotContains(t, te.Message, "call the tool again")
 	require.NotNil(t, te.Tx)
 	require.Equal(t, txHash, te.Tx.TxHash)
+	require.Equal(t, 1, chain.sendCount())
+
+	// After the token expires, a replay of the spent approval still says
+	// already used, not expired, so the agent is not told to send again.
+	now = now.Add(confirmStateTTL + time.Minute)
+	err = call(in, state)
+	require.ErrorAs(t, err, &te)
+	require.Contains(t, te.Message, "already used")
+	require.NotContains(t, te.Message, "call the tool again")
+	require.NotNil(t, te.Tx)
+	require.Equal(t, txHash, te.Tx.TxHash)
+
+	now = now.Add(spentRetention)
+	err = call(in, state)
+	require.ErrorAs(t, err, &te)
+	require.Contains(t, te.Message, "may already be broadcast")
+	require.Contains(t, te.Message, "Ask the user")
+	require.NotContains(t, te.Message, "call the tool again")
 	require.Equal(t, 1, chain.sendCount())
 }
 
@@ -864,6 +939,28 @@ func TestWaitTimesOutWithHint(t *testing.T) {
 			require.Contains(t, out["hint"], "Do not call ibc_ift_send again")
 		})
 	}
+}
+
+func TestWaitTimeoutBoundsSlowRelayerQuery(t *testing.T) {
+	h := newHarness(t, clientOpts{})
+	var polls atomic.Int32
+	h.relayer.onPackets = func(ctx context.Context) {
+		// The first poll answers; the second hangs until its context ends.
+		if polls.Add(1) > 1 {
+			<-ctx.Done()
+		}
+	}
+	h.relayer.script = [][]PacketStatus{{packet(StatePending, false)}}
+
+	start := time.Now()
+	out, terr := h.call("ibc_wait_for_packets", map[string]any{
+		"chain_id": chainA, "tx_hash": txHash, "timeout_seconds": 1,
+	}, nil)
+	require.Less(t, time.Since(start), 3*time.Second, "the query is bound by timeout_seconds")
+	require.Nil(t, terr, "a wait timeout is not an error")
+	require.Equal(t, true, out["timed_out"])
+	require.Equal(t, waitMovingHint, out["hint"])
+	require.Len(t, out["packets"], 1, "the last answered poll is reported")
 }
 
 func TestWaitNotSelectedReturnsImmediately(t *testing.T) {
@@ -1096,6 +1193,39 @@ func (loopCursorRelayer) Packets(context.Context, PacketFilter, uint32, string) 
 func TestTxPacketsStopsOnRepeatedCursor(t *testing.T) {
 	srv, err := New(&fakeChain{}, loopCursorRelayer{}, Options{})
 	require.NoError(t, err)
-	_, err = srv.txPackets(context.Background(), chainA, txHash)
+	_, _, err = srv.txPackets(context.Background(), chainA, txHash)
 	require.ErrorContains(t, err, "repeated")
+}
+
+// panicChain panics while reading token metadata.
+type panicChain struct{ *fakeChain }
+
+func (panicChain) TokenInfo(context.Context, string, string) (TokenInfo, error) {
+	var info *TokenInfo
+	return *info, nil
+}
+
+func TestHandlerPanicIsAnErrorNotACrash(t *testing.T) {
+	srv, err := New(panicChain{&fakeChain{}}, &fakeRelayer{}, Options{})
+	require.NoError(t, err)
+	ctx := context.Background()
+	ct, st := mcp.NewInMemoryTransports()
+	ss, err := srv.MCP().Connect(ctx, st, nil)
+	require.NoError(t, err)
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil).Connect(ctx, ct, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = cs.Close()
+		_ = ss.Wait()
+		_ = srv.Close()
+	})
+
+	_, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "ibc_ift_balance", Arguments: map[string]any{
+		"chain_id": chainA, "ift": tokenA, "address": agentKey,
+	}})
+	require.ErrorContains(t, err, "internal error")
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ibc_get_context"})
+	require.NoError(t, err, "the server keeps serving after a handler panic")
+	require.False(t, res.IsError)
 }

@@ -55,7 +55,15 @@ func startRelayerMCP(
 	if err := mcpserver.RequireLoopback(listen); err != nil {
 		return nil, err
 	}
-	auditPath, err := mcpAuditPath(globalFlags.Home, cfg.MCP)
+	auditPath, err := mcpHomePath(globalFlags.Home, cfg.MCP.AuditLog, mcpserver.AuditFileName)
+	if err != nil {
+		return nil, err
+	}
+	tokenPath, err := mcpHomePath(globalFlags.Home, cfg.MCP.TokenFile, mcpserver.TokenFileName)
+	if err != nil {
+		return nil, err
+	}
+	token, err := mcpserver.LoadOrCreateToken(tokenPath)
 	if err != nil {
 		return nil, err
 	}
@@ -79,33 +87,21 @@ func startRelayerMCP(
 		_ = audit.Close()
 		return nil, err
 	}
-	// os.Stdout is a different stream from the relayer logger. The MCP Go SDK
-	// stdio transport and fmt.Print write there. Copy it onto the logger, which
-	// writes the stderr docker logs and kubectl logs collect. The image runs
-	// /opt/ibc with no shell, so nothing else merges the two streams.
-	restoreStdout, err := redirectMCPStdout(slog.With("module", "mcp"))
+	h, err := srv.ListenHTTP(listen, token)
 	if err != nil {
-		_ = srv.Close()
-		return nil, err
-	}
-	h, err := srv.ListenHTTP(listen)
-	if err != nil {
-		restoreStdout()
 		_ = srv.Close()
 		return nil, err
 	}
 
 	// stderr, via slog. The container image runs /opt/ibc with no log redirect,
 	// so docker logs and kubectl logs are this stream. The audit file is not.
-	slog.Info("MCP server listening", "url", h.URL())
+	slog.Info("MCP server listening", "url", h.URL(), "tokenFile", tokenPath)
 
 	var once sync.Once
 	var stopErr error
 	return func() error {
 		once.Do(func() {
 			stopErr = stdErrors.Join(h.Stop(), srv.Close())
-			// Flush stdout after handlers return, then put the process stream back.
-			restoreStdout()
 			if stopErr != nil {
 				slog.Error("MCP server stopped", "err", stopErr)
 				stopErr = errors.Wrap(stopErr, "stop MCP server")
@@ -117,17 +113,17 @@ func startRelayerMCP(
 	}, nil
 }
 
-// mcpAuditPath is where MCP writes are recorded. An empty config path uses
-// mcp-audit.jsonl in the IBC home. A relative path is joined to that home.
-func mcpAuditPath(home string, cfg config.MCPConfig) (string, error) {
+// mcpHomePath resolves an MCP file setting such as mcp.auditLog. An empty
+// setting uses defaultName in the IBC home. A relative path is joined to that home.
+func mcpHomePath(home, configured, defaultName string) (string, error) {
 	home, err := config.ExpandHome(home)
 	if err != nil {
 		return "", err
 	}
-	if cfg.AuditLog == "" {
-		return filepath.Join(home, mcpserver.AuditFileName), nil
+	if configured == "" {
+		return filepath.Join(home, defaultName), nil
 	}
-	path, err := config.ExpandHome(cfg.AuditLog)
+	path, err := config.ExpandHome(configured)
 	if err != nil {
 		return "", err
 	}
@@ -233,12 +229,26 @@ func (b *evmBackend) IFTSend(ctx context.Context, req mcpserver.SendRequest) (mc
 	if err != nil {
 		return mcpserver.TxRef{}, mcpserver.NewError(mcpserver.CodeConfigError, "encode transfer: %s", redactRPC(err))
 	}
-	hash, receipt, err := submitter.Confirm(ctx, v2.TxIntent{To: req.IFT, Data: data}, req.ConfirmTimeout)
+	var onReplace evmsub.ReplaceFunc
+	if req.OnReplaced != nil {
+		onReplace = func(previous, replacement string) {
+			slog.Warn("MCP tx re-signed at the same nonce", "chain", req.ChainID,
+				"previousTx", previous, "tx", replacement, "from", req.From)
+			req.OnReplaced(previous, replacement)
+		}
+	}
+	hash, receipt, err := submitter.Confirm(ctx, v2.TxIntent{To: req.IFT, Data: data}, req.ConfirmTimeout, onReplace)
 	if hash == "" {
 		if err == nil {
 			err = stdErrors.New("no transaction")
 		}
-		// Nothing was broadcast. The agent may retry.
+		// Nothing was broadcast. A transfer that reverts in simulation reverts
+		// again until chain state changes, so it is not retryable.
+		if stdErrors.Is(err, evmsub.ErrEstimationReverted) {
+			return mcpserver.TxRef{}, mcpserver.NewError(mcpserver.CodeTxReverted,
+				"transfer reverts in simulation and was not broadcast: %s", redactRPC(err))
+		}
+		// Any other failure before broadcast may be transient. The agent may retry.
 		return mcpserver.TxRef{}, mcpserver.NewError(mcpserver.CodeChainRPCError, "submit: %s", redactRPC(err))
 	}
 	ref := mcpserver.TxRef{ChainID: req.ChainID, TxHash: hash}

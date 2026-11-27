@@ -101,8 +101,8 @@ Collections inside that threshold re-emit the last observed value. A failed quer
 | processors  | `transactions_confirmed_total`  | counter            | `chain_id`, `client_id`                                             | +1 per successful receipt                                      |
 | processors  | `transaction_retries_total`     | counter            | `chain_id`, `dest_chain_id`, `client_id`, `dest_client_id`, `type`  | +1 per submitted transaction retried                           |
 | processors | `relay_packet_execution_total` | counter | `chain_id`, `dest_chain_id`, `client_id`, `dest_client_id`, `processor`, `result` | Per-packet relay outcome; `result`: `executed` (the packet's event was found and its status saved), `failed` (the relay tx was retried: reverted, missing the packet's event, or no receipt by the retry threshold) |
-| txsubmitter | `transaction_submission_attempts_total` | counter | `chain_id`, `wallet`, `result` | +1 per completed Submit call; `result`: `ok`, `error` (including capacity deferrals). Internal fee replacements do not add attempts. |
-| txsubmitter | `evm_gas_spent`                 | observable counter | `chain_id`, `wallet`                                                | Cumulative mined cost of txs this submitter sent, including failed txs, in native-token units |
+| txsubmitter | `transaction_submission_attempts_total` | counter | `chain_id`, `wallet`, `result` | +1 per completed Submit call, and per MCP send (Confirm); `result`: `ok`, `error` (including capacity deferrals, and an MCP send that was broadcast but not confirmed). Internal fee replacements do not add attempts. |
+| txsubmitter | `evm_gas_spent`                 | observable counter | `chain_id`, `wallet`                                                | Cumulative mined cost of txs this submitter sent, including failed txs, in native-token units. An MCP send counts only when its receipt arrives within the send's confirmation wait; one mined later, or mined as a replacement after that wait, is not counted |
 | txsubmitter | `evm_gas_balance`               | observable gauge   | `chain_id`, `wallet`                                                | Latest EVM wallet balance in native-token units; `-1` on error |
 | watcher     | `watcher_events_total`          | counter            | `chain_id`, `type` (`send_packet`)                                  | Observed send-packet events                                    |
 | watcher | `packet_event_stream_up` | gauge | `chain_id` | 1 while connected, including idle periods; 0 before connecting, during reconnection, and after shutdown. Only chains with auto-relay enabled emit it. |
@@ -123,8 +123,11 @@ empty when `result` is `ok`. A tool error uses its code: `INVALID_ARGUMENT`,
 `POLICY_DENIED`, `USER_DECLINED`, `CONFIG_ERROR`, `CHAIN_RPC_ERROR`,
 `TX_REVERTED`, `TX_NOT_CONFIRMED`, `RELAYER_UNAVAILABLE`, or `RELAYER_ERROR`.
 Anything else is `other`. Amounts, addresses, transaction hashes, and RPC URLs
-are not label values. A call that asks for confirmation counts as `ok`; the
-retry is another call.
+are not label values. A send that needs the user's approval counts differently
+by client protocol. A client on protocol 2026-07-28 or later gets the approval
+request as the result and calls again: the first call counts as `ok`, and the
+retry is another call. For an older client the server asks the user itself, and
+the call is counted once, with its final result.
 
 ### EVM client metrics
 

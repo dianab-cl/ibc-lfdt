@@ -88,6 +88,9 @@ type MCPConfig struct {
 	ListenAddr string `yaml:"listenAddr,omitempty"`
 	// Append-only JSONL file of MCP writes. Empty uses mcp-audit.jsonl in the IBC home.
 	AuditLog string `yaml:"auditLog,omitempty"`
+	// File holding the bearer token MCP clients must send. Empty uses mcp-token in the IBC home.
+	// A missing file is created with a random token and mode 0600.
+	TokenFile string `yaml:"tokenFile,omitempty"`
 }
 
 // ServerConfig config for RPC server for both relayer and attestor

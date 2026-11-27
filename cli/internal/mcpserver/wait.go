@@ -83,8 +83,10 @@ func (s *Server) waitForPackets(
 	}
 
 	start := time.Now()
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
+	// waitCtx bounds each relayer query as well as the sleep between them, so
+	// a slow or paginated query cannot hold the call past timeout_seconds.
+	waitCtx, waitCancel := context.WithTimeout(ctx, timeout)
+	defer waitCancel()
 	ticker := time.NewTicker(s.poll)
 	defer ticker.Stop()
 
@@ -92,28 +94,41 @@ func (s *Server) waitForPackets(
 	seen := map[string]PacketState{}
 	var packets []PacketStatus
 	var lastErr *ToolError
+	used := in.TxHash
+	hint := func(h string) string {
+		if note := replacedNote(in.TxHash, used); note != "" {
+			return note + " " + h
+		}
+		return h
+	}
 
 	for {
-		got, err := s.txPackets(ctx, in.ChainID, in.TxHash)
+		got, gotHash, err := s.txPackets(waitCtx, in.ChainID, in.TxHash)
 		if err == nil {
-			packets, lastErr = got, nil
+			packets, used, lastErr = got, gotHash, nil
 			notifier.changes(ctx, seen, packets, until)
 			if len(packets) > 0 && allReached(packets, until) {
 				out := waitResult(packets, true, false, start)
-				out.Hint = waitDoneHint
+				out.Hint = hint(waitDoneHint)
 				return nil, out, nil
 			}
 			// not_selected is not in progress. Return the relay hint now
 			// instead of holding the call until timeout_seconds.
 			if countState(packets, StateNotSelected) > 0 {
 				out := waitResult(packets, false, false, start)
-				out.Hint = waitNotSelectedHint
+				out.Hint = hint(waitNotSelectedHint)
 				return nil, out, nil
 			}
 		}
 
 		if ctx.Err() != nil {
 			return nil, WaitOutput{}, waitCancelError(ctx.Err())
+		}
+		if waitCtx.Err() != nil {
+			// The wait's own deadline, not a cancellation: a normal timed-out result.
+			out := waitResult(packets, false, true, start)
+			out.Hint = hint(waitTimeoutHint(packets, lastErr))
+			return nil, out, nil
 		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -128,9 +143,9 @@ func (s *Server) waitForPackets(
 		select {
 		case <-ctx.Done():
 			return nil, WaitOutput{}, waitCancelError(ctx.Err())
-		case <-deadline.C:
+		case <-waitCtx.Done():
 			out := waitResult(packets, false, true, start)
-			out.Hint = waitTimeoutHint(packets, lastErr)
+			out.Hint = hint(waitTimeoutHint(packets, lastErr))
 			return nil, out, nil
 		case <-ticker.C:
 		}
@@ -150,8 +165,24 @@ func waitCancelError(err error) *ToolError {
 	return newError(CodeRelayerError, "%s", waitCanceledMessage)
 }
 
-// txPackets lists every packet of one source tx, following pagination.
-func (s *Server) txPackets(ctx context.Context, chainID, txHash string) ([]PacketStatus, error) {
+// txPackets lists every packet of one source tx. For a send the relayer
+// re-signed it uses whichever hash of that transfer has packets, newest
+// first, and returns the hash it used.
+func (s *Server) txPackets(ctx context.Context, chainID, txHash string) ([]PacketStatus, string, error) {
+	for _, h := range s.replaced.family(txHash) {
+		packets, err := s.txHashPackets(ctx, chainID, h)
+		if err != nil {
+			return nil, txHash, err
+		}
+		if len(packets) > 0 {
+			return packets, h, nil
+		}
+	}
+	return []PacketStatus{}, txHash, nil
+}
+
+// txHashPackets lists every packet of one source tx hash, following pagination.
+func (s *Server) txHashPackets(ctx context.Context, chainID, txHash string) ([]PacketStatus, error) {
 	filter := PacketFilter{SourceChainID: chainID, SourceTxHash: txHash}
 	all := []PacketStatus{}
 	seen := map[string]struct{}{}

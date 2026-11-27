@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
@@ -29,6 +30,8 @@ func TestSendAuditRecordsOutcome(t *testing.T) {
 	require.Equal(t, 1, chain.sendCount())
 
 	recs := readAudit(t, path)
+	// The relay the send requested belongs to the send and has no line of its own.
+	require.Equal(t, 1, rel.relayCount())
 	require.Len(t, recs, 2)
 	require.Equal(t, recs[0].ID, recs[1].ID)
 	require.Equal(t, outcomeIntent, recs[0].Outcome)
@@ -68,6 +71,15 @@ func TestSendAuditDenialDoesNotSubmit(t *testing.T) {
 	require.Len(t, recs, 1)
 	require.Equal(t, outcomeDenied, recs[0].Outcome)
 	require.Equal(t, string(CodePolicyDenied), recs[0].Code)
+
+	// An invalid argument is refused with one failed line and no intent line.
+	_, _, err = srv.iftSend(context.Background(), &mcp.CallToolRequest{}, sendInput("1.5"))
+	require.Error(t, err)
+	require.Zero(t, chain.sendCount())
+	recs = readAudit(t, path)
+	require.Len(t, recs, 2)
+	require.Equal(t, outcomeFailed, recs[1].Outcome)
+	require.Equal(t, string(CodeInvalidArgument), recs[1].Code)
 }
 
 func TestSendAuditClosedBlocksBroadcast(t *testing.T) {
@@ -89,8 +101,9 @@ func TestSendAuditClosedBlocksBroadcast(t *testing.T) {
 
 func TestSendAuditFinalFailureKeepsMinedTx(t *testing.T) {
 	chain := &fakeChain{}
-	srv, err := New(chain, &fakeRelayer{}, Options{SkipConfirmation: true})
+	srv, err := New(chain, &fakeRelayer{}, Options{})
 	require.NoError(t, err)
+	srv.skipConfirmation = true
 	script := &scriptedAudit{failAt: 2}
 	srv.audit = script
 
@@ -188,8 +201,9 @@ func auditProcessLine(t *testing.T, logs, marker string) string {
 
 func newAuditServer(t *testing.T, chain ChainBackend, rel RelayerBackend, log *AuditLog) *Server {
 	t.Helper()
-	srv, err := New(chain, rel, Options{SkipConfirmation: true, Audit: log})
+	srv, err := New(chain, rel, Options{Audit: log})
 	require.NoError(t, err)
+	srv.skipConfirmation = true
 	t.Cleanup(func() { _ = srv.Close() })
 	return srv
 }
@@ -235,3 +249,120 @@ var errDiskFull = errString("disk full")
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// slowChain broadcasts, then returns only after its context is cancelled and
+// a further delay, as a send waiting on the signer lock at shutdown would.
+type slowChain struct {
+	*fakeChain
+	entered chan struct{}
+}
+
+func (c slowChain) IFTSend(ctx context.Context, req SendRequest) (TxRef, error) {
+	close(c.entered)
+	<-ctx.Done()
+	time.Sleep(100 * time.Millisecond)
+	return TxRef{}, NewTxError(CodeTxNotConfirmed, TxRef{ChainID: req.ChainID, TxHash: txHash}, "not mined")
+}
+
+func TestCloseWaitsForSendOutcome(t *testing.T) {
+	path := filepath.Join(t.TempDir(), AuditFileName)
+	log, err := OpenAuditLog(path)
+	require.NoError(t, err)
+	chain := slowChain{fakeChain: &fakeChain{}, entered: make(chan struct{})}
+	srv, err := New(chain, &fakeRelayer{}, Options{Audit: log})
+	require.NoError(t, err)
+	srv.skipConfirmation = true
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := srv.iftSend(context.Background(), &mcp.CallToolRequest{}, sendInput("100"))
+		done <- err
+	}()
+	<-chain.entered
+	require.NoError(t, srv.Close())
+	requireCode(t, <-done, CodeTxNotConfirmed)
+
+	recs := readAudit(t, path)
+	require.Len(t, recs, 2)
+	require.Equal(t, outcomeNotConfirmed, recs[1].Outcome)
+	require.Equal(t, txHash, recs[1].TxHash, "the broadcast hash survives shutdown")
+
+	_, _, err = srv.iftSend(context.Background(), &mcp.CallToolRequest{}, sendInput("100"))
+	requireCode(t, err, CodeRelayerUnavailable)
+}
+
+// hangChain broadcasts and does not return until released, as a send stuck
+// past every shutdown deadline would.
+type hangChain struct {
+	*fakeChain
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c hangChain) IFTSend(_ context.Context, req SendRequest) (TxRef, error) {
+	close(c.entered)
+	<-c.release
+	return TxRef{}, NewTxError(CodeTxNotConfirmed, TxRef{ChainID: req.ChainID, TxHash: txHash}, "not mined")
+}
+
+func newHangServer(t *testing.T) (*Server, hangChain, string) {
+	t.Helper()
+	previous := writeDrainTimeout
+	writeDrainTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { writeDrainTimeout = previous })
+	path := filepath.Join(t.TempDir(), AuditFileName)
+	log, err := OpenAuditLog(path)
+	require.NoError(t, err)
+	chain := hangChain{fakeChain: &fakeChain{}, entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(chain.release) })
+	srv, err := New(chain, &fakeRelayer{}, Options{Audit: log})
+	require.NoError(t, err)
+	srv.skipConfirmation = true
+	go func() { _, _, _ = srv.iftSend(context.Background(), &mcp.CallToolRequest{}, sendInput("100")) }()
+	<-chain.entered
+	return srv, chain, path
+}
+
+func TestCloseDrainIsBoundedAndRefusalsAreAudited(t *testing.T) {
+	srv, _, path := newHangServer(t)
+
+	// HTTPServer.Stop calls stop first; that starts the drain's clock.
+	start := time.Now()
+	srv.stop()
+	closed := make(chan error, 1)
+	go func() { closed <- srv.Close() }()
+
+	// While Close drains, a new write is refused, and the refusal is audited.
+	require.Eventually(t, func() bool {
+		srv.writesMu.Lock()
+		defer srv.writesMu.Unlock()
+		return srv.stopping
+	}, time.Second, time.Millisecond)
+	_, _, err := srv.relayTx(context.Background(), nil, RelayInput{ChainID: chainA, TxHash: txHash})
+	requireCode(t, err, CodeRelayerUnavailable)
+
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(3 * writeDrainTimeout):
+		t.Fatal("Close did not give up on a stuck send")
+	}
+	require.Less(t, time.Since(start), writeDrainTimeout+200*time.Millisecond)
+
+	recs := readAudit(t, path)
+	require.Len(t, recs, 2, "the stuck send's intent line and the refused relay")
+	require.Equal(t, outcomeIntent, recs[0].Outcome)
+	require.Equal(t, "ibc_relay_tx", recs[1].Tool)
+	require.Equal(t, string(CodeRelayerUnavailable), recs[1].Code)
+}
+
+func TestCloseDoesNotWaitAgainAfterHTTPStopDeadline(t *testing.T) {
+	srv, _, _ := newHangServer(t)
+
+	srv.stop()
+	// The HTTP stop used its whole deadline, longer than the drain.
+	time.Sleep(writeDrainTimeout + 50*time.Millisecond)
+	start := time.Now()
+	require.NoError(t, srv.Close())
+	require.Less(t, time.Since(start), 100*time.Millisecond, "MCP stays within one deadline")
+}

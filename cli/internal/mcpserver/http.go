@@ -17,7 +17,15 @@ import (
 const (
 	httpReadHeaderTimeout = 10 * time.Second
 	httpSessionTimeout    = 30 * time.Minute
-	httpShutdownTimeout   = 5 * time.Second
+)
+
+// httpShutdownTimeout bounds how long Stop waits for connections to finish
+// before closing them. httpSessionCloseTimeout is the share of it that closing
+// MCP sessions may use, so the relayer's own stop keeps most of its graceful
+// window. Tests shorten both.
+var (
+	httpShutdownTimeout     = 5 * time.Second
+	httpSessionCloseTimeout = time.Second
 )
 
 // HTTPServer serves a Server over MCP streamable HTTP on its own listener,
@@ -28,13 +36,19 @@ type HTTPServer struct {
 	listener net.Listener
 	stop     context.CancelFunc
 	done     chan struct{}
+	// closeSessions ends every MCP session, which ends its open event stream.
+	// Shutdown waits for those streams and does not close them.
+	closeSessions func()
 }
 
 // ListenHTTP binds addr and serves in the background. Binding happens before
-// it returns, so a taken port fails the caller's startup. The endpoint has no
-// authentication and can sign transactions, so only loopback addresses are
-// accepted.
-func (s *Server) ListenHTTP(addr string) (*HTTPServer, error) {
+// it returns, so a taken port fails the caller's startup. Every request must
+// carry "Authorization: Bearer <token>". The endpoint can sign transactions,
+// so only loopback addresses are accepted as well.
+func (s *Server) ListenHTTP(addr, token string) (*HTTPServer, error) {
+	if len(token) < minTokenLength {
+		return nil, pkgerrors.Errorf("MCP bearer token must be at least %d characters", minTokenLength)
+	}
 	if err := RequireLoopback(addr); err != nil {
 		return nil, err
 	}
@@ -48,11 +62,17 @@ func (s *Server) ListenHTTP(addr string) (*HTTPServer, error) {
 	}
 
 	logger := slog.With("module", "mcp")
-	handler := mcp.NewStreamableHTTPHandler(
+	handler := requireBearer(token, mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return s.mcp },
 		&mcp.StreamableHTTPOptions{Logger: logger, SessionTimeout: httpSessionTimeout},
-	)
-	return startHTTP(listener, handler, s.stop, logger), nil
+	))
+	h := startHTTP(listener, handler, s.stop, logger)
+	h.closeSessions = func() {
+		for ss := range s.mcp.Sessions() {
+			_ = ss.Close()
+		}
+	}
+	return h, nil
 }
 
 // startHTTP serves handler on listener. ErrorLog is the relayer logger.
@@ -84,18 +104,35 @@ func (h *HTTPServer) Addr() net.Addr { return h.listener.Addr() }
 // URL is the endpoint MCP clients connect to.
 func (h *HTTPServer) URL() string { return "http://" + h.Addr().String() }
 
-// Stop cancels in-flight tool calls and shuts the listener down.
+// Stop cancels in-flight tool calls, ends open MCP sessions, and shuts the
+// listener down. Any connection still open after httpShutdownTimeout is closed.
 func (h *HTTPServer) Stop() error {
 	h.stop()
 	ctx, cancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
 	defer cancel()
-	err := h.server.Shutdown(ctx)
-	if h.waitServe(ctx) {
-		return err
+	if h.closeSessions != nil {
+		// A session close waits until no call is outstanding. An approval prompt
+		// the client never answers stays outstanding even after its wait is
+		// cancelled, so this close is bounded by the same deadline.
+		closed := make(chan struct{})
+		go func() {
+			defer close(closed)
+			h.closeSessions()
+		}()
+		sessions, sessionsCancel := context.WithTimeout(ctx, httpSessionCloseTimeout)
+		select {
+		case <-closed:
+		case <-sessions.Done():
+		}
+		sessionsCancel()
 	}
-	// A handler that ignored cancellation still holds the connection.
-	// Close drops it so Serve can return.
-	_ = h.server.Close()
+	err := h.server.Shutdown(ctx)
+	if err != nil {
+		// Shutdown leaves active connections open when its deadline passes, such
+		// as a handler that ignored cancellation. Close drops them. Serve has
+		// already returned, so its exit does not show whether this is needed.
+		_ = h.server.Close()
+	}
 	wait, waitCancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
 	defer waitCancel()
 	h.waitServe(wait)
@@ -119,7 +156,7 @@ func RequireLoopback(addr string) error {
 	}
 	if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
 		return pkgerrors.Errorf(
-			"MCP listen address %q is not loopback; the endpoint has no authentication", addr)
+			"MCP listen address %q is not loopback; only local clients may connect", addr)
 	}
 	return nil
 }
@@ -130,7 +167,7 @@ func requireBoundLoopback(addr net.Addr) error {
 	tcp, ok := addr.(*net.TCPAddr)
 	if !ok || tcp == nil || tcp.IP == nil || !tcp.IP.IsLoopback() {
 		return pkgerrors.Errorf(
-			"MCP listen address %q is not loopback; the endpoint has no authentication", addr)
+			"MCP listen address %q is not loopback; only local clients may connect", addr)
 	}
 	return nil
 }

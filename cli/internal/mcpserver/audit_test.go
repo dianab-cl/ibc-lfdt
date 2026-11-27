@@ -74,3 +74,19 @@ func readAudit(t *testing.T, path string) []auditRecord {
 	require.NoError(t, sc.Err())
 	return out
 }
+
+func TestOpenAuditLogRestrictsExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), AuditFileName)
+	require.NoError(t, os.WriteFile(path, []byte("{}\n"), 0o600))
+	require.NoError(t, os.Chmod(path, 0o644))
+
+	log, err := OpenAuditLog(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = log.Close() })
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "{}\n", string(data), "existing lines are kept")
+}

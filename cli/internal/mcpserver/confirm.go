@@ -16,6 +16,10 @@ import (
 const (
 	confirmInputKey = "confirm"
 	confirmStateTTL = 10 * time.Minute
+	// spentRetention is how long a spent approval is remembered after its
+	// token expires. Until then a replay is reported as already used, not as
+	// expired, so the agent is not told to send again after a broadcast.
+	spentRetention = 24 * time.Hour
 )
 
 // confirmations issues and checks the RequestState that ties a user's
@@ -26,7 +30,11 @@ const (
 // different one, and each nonce is accepted once.
 type confirmations struct {
 	secret []byte
-	now    func() time.Time
+	// run identifies this process's tokens. The secret and the spent set live
+	// in memory, so a token from an earlier run cannot be checked; the run ID
+	// lets redeem say so instead of reporting a mismatch.
+	run string
+	now func() time.Time
 
 	mu sync.Mutex
 	// used records a nonce that was accepted. tx is set once broadcast returns
@@ -36,6 +44,7 @@ type confirmations struct {
 }
 
 // spentConfirm is one redeemed approval. expiry is the token's own expiry.
+// The record is kept until spentRetention after it.
 type spentConfirm struct {
 	expiry time.Time
 	tx     *TxRef
@@ -46,7 +55,13 @@ func newConfirmations(now func() time.Time) *confirmations {
 	if _, err := rand.Read(secret); err != nil {
 		panic(err)
 	}
-	return &confirmations{secret: secret, now: now, used: map[string]spentConfirm{}}
+	run := make([]byte, 8)
+	if _, err := rand.Read(run); err != nil {
+		panic(err)
+	}
+	return &confirmations{
+		secret: secret, run: hex.EncodeToString(run), now: now, used: map[string]spentConfirm{},
+	}
 }
 
 // issue returns a state token for the write described by fields.
@@ -57,7 +72,7 @@ func (c *confirmations) issue(fields ...string) string {
 	}
 	n := hex.EncodeToString(nonce)
 	exp := c.now().Add(confirmStateTTL).UTC().Format(time.RFC3339)
-	return n + "." + exp + "." + c.mac(n, exp, fields)
+	return c.run + "." + n + "." + exp + "." + c.mac(n, exp, fields)
 }
 
 // confirmStatus is the result of redeem. Mismatch and expiry do not spend the
@@ -68,36 +83,54 @@ type confirmStatus int
 const (
 	confirmAccepted confirmStatus = iota
 	confirmMismatch
+	// confirmExpired is a token that expired unspent.
 	confirmExpired
 	confirmUsed
+	// confirmStale expired more than spentRetention ago, so whether it was
+	// spent is no longer known.
+	confirmStale
+	// confirmOtherRun was issued by an earlier run of this server, before a
+	// restart, so whether it was spent is not known.
+	confirmOtherRun
 )
 
 // redeem checks a state token against the write's fields and spends it.
 // A mismatch or an expiry leaves the nonce unspent. A nonce that was already
-// accepted stays spent.
+// accepted stays spent, and is reported as used even after its token expires.
 func (c *confirmations) redeem(state string, fields ...string) confirmStatus {
-	nonce, exp, mac, ok := splitConfirmState(state)
+	run, nonce, exp, mac, ok := splitConfirmState(state)
 	if !ok {
 		return confirmMismatch
+	}
+	if run != c.run {
+		return confirmOtherRun
 	}
 	if !hmac.Equal([]byte(mac), []byte(c.mac(nonce, exp, fields))) {
 		return confirmMismatch
 	}
 	expiry, err := time.Parse(time.RFC3339, exp)
-	if err != nil || c.now().After(expiry) {
-		return confirmExpired
+	if err != nil {
+		return confirmMismatch
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
 	for n, rec := range c.used {
-		if now.After(rec.expiry) {
+		if now.After(rec.expiry.Add(spentRetention)) {
 			delete(c.used, n)
 		}
 	}
+	// Spent is checked before expiry: an expired token that was spent may
+	// already have been broadcast.
 	if _, spent := c.used[nonce]; spent {
 		return confirmUsed
+	}
+	if now.After(expiry.Add(spentRetention)) {
+		return confirmStale
+	}
+	if now.After(expiry) {
+		return confirmExpired
 	}
 	c.used[nonce] = spentConfirm{expiry: expiry}
 	return confirmAccepted
@@ -109,8 +142,8 @@ func (c *confirmations) noteTx(state string, tx TxRef) {
 	if tx.TxHash == "" {
 		return
 	}
-	nonce, _, _, ok := splitConfirmState(state)
-	if !ok {
+	run, nonce, _, _, ok := splitConfirmState(state)
+	if !ok || run != c.run {
 		return
 	}
 	c.mu.Lock()
@@ -127,8 +160,8 @@ func (c *confirmations) noteTx(state string, tx TxRef) {
 // spentTx returns the hash stored for a spent approval, or nil when broadcast
 // has not returned one.
 func (c *confirmations) spentTx(state string) *TxRef {
-	nonce, _, _, ok := splitConfirmState(state)
-	if !ok {
+	run, nonce, _, _, ok := splitConfirmState(state)
+	if !ok || run != c.run {
 		return nil
 	}
 	c.mu.Lock()
@@ -141,12 +174,12 @@ func (c *confirmations) spentTx(state string) *TxRef {
 	return &copied
 }
 
-func splitConfirmState(state string) (nonce, exp, mac string, ok bool) {
+func splitConfirmState(state string) (run, nonce, exp, mac string, ok bool) {
 	parts := strings.Split(state, ".")
-	if len(parts) != 3 || parts[0] == "" {
-		return "", "", "", false
+	if len(parts) != 4 || parts[0] == "" || parts[1] == "" {
+		return "", "", "", "", false
 	}
-	return parts[0], parts[1], parts[2], true
+	return parts[0], parts[1], parts[2], parts[3], true
 }
 
 func (c *confirmations) mac(nonce, exp string, fields []string) string {

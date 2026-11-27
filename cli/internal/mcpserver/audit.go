@@ -25,6 +25,8 @@ const (
 	outcomeDenied       = "denied"
 	outcomeDeclined     = "declined"
 	outcomeRelayed      = "relayed"
+	// outcomeReplaced is a send the relayer re-signed at the same nonce.
+	outcomeReplaced = "replaced"
 )
 
 // auditRecord is one JSON line. An intent line is synced before a send or a
@@ -59,13 +61,42 @@ type AuditLog struct {
 	file *os.File
 }
 
-// OpenAuditLog creates or appends to path. The file is owner-readable only.
+// OpenAuditLog creates or appends to path. The file is owner-readable only:
+// an existing file that group or others can access is set to 0600 first.
 func OpenAuditLog(path string) (*AuditLog, error) {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open audit log %s: %w", path, err)
 	}
+	if err := restrictToOwner(f, path); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
 	return &AuditLog{file: f}, nil
+}
+
+// restrictToOwner sets f to mode 0600 when group or others have any access.
+// The create mode only applies to a new file; an existing one keeps its own.
+// A file that cannot be changed, such as one on a read-only mount, is an error
+// rather than a file left readable.
+func restrictToOwner(f *os.File, path string) error {
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	// Checked before any chmod: a path that names a directory, such as the
+	// IBC home, must not lose its execute bits.
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	if info.Mode().Perm()&0o077 == 0 {
+		return nil
+	}
+	if err := f.Chmod(0o600); err != nil {
+		return fmt.Errorf("%s is accessible to group or others (mode %04o) and could not be set to 0600: %w",
+			path, info.Mode().Perm(), err)
+	}
+	return nil
 }
 
 func (a *AuditLog) write(rec auditRecord) error {

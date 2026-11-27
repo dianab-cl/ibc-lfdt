@@ -5,9 +5,11 @@ package mcpserver
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,13 +23,13 @@ func TestListenHTTP(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = srv.Close() })
 
-	h, err := srv.ListenHTTP("127.0.0.1:0")
+	h, err := srv.ListenHTTP("127.0.0.1:0", testToken)
 	require.NoError(t, err)
 	require.NotNil(t, h.server.ErrorLog, "panics recovered by net/http go to the relayer logger")
 
 	ctx := context.Background()
 	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil).
-		Connect(ctx, &mcp.StreamableClientTransport{Endpoint: h.URL()}, nil)
+		Connect(ctx, &mcp.StreamableClientTransport{HTTPClient: bearerClient(testToken), Endpoint: h.URL()}, nil)
 	require.NoError(t, err)
 
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ibc_get_context"})
@@ -37,7 +39,7 @@ func TestListenHTTP(t *testing.T) {
 
 	require.NoError(t, h.Stop())
 	_, err = mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil).
-		Connect(ctx, &mcp.StreamableClientTransport{Endpoint: h.URL(), MaxRetries: -1}, nil)
+		Connect(ctx, &mcp.StreamableClientTransport{HTTPClient: bearerClient(testToken), Endpoint: h.URL(), MaxRetries: -1}, nil)
 	require.Error(t, err, "stopped server refuses connections")
 }
 
@@ -51,12 +53,12 @@ func TestStopCancelsInFlightWait(t *testing.T) {
 	}
 	srv, err := New(&fakeChain{}, rel, Options{PollInterval: time.Hour})
 	require.NoError(t, err)
-	h, err := srv.ListenHTTP("127.0.0.1:0")
+	h, err := srv.ListenHTTP("127.0.0.1:0", testToken)
 	require.NoError(t, err)
 
 	ctx := context.Background()
 	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil).
-		Connect(ctx, &mcp.StreamableClientTransport{Endpoint: h.URL()}, nil)
+		Connect(ctx, &mcp.StreamableClientTransport{HTTPClient: bearerClient(testToken), Endpoint: h.URL()}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cs.Close() })
 
@@ -78,24 +80,60 @@ func TestStopCancelsInFlightWait(t *testing.T) {
 		t.Fatal("wait did not reach the relayer")
 	}
 
-	err = h.Stop()
-	// A connected client's event stream stays active until Shutdown's deadline,
-	// then Stop closes it. The tool call must already have been canceled.
-	if err != nil {
-		require.ErrorIs(t, err, context.DeadlineExceeded)
-	}
+	// Stop ends the client's session and its event stream, so Shutdown does
+	// not wait for its deadline. The tool call must already have been canceled.
+	stopStart := time.Now()
+	require.NoError(t, h.Stop())
+	require.Less(t, time.Since(stopStart), httpShutdownTimeout)
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("in-flight wait still running after stop")
 	}
 	_, err = mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil).
-		Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: h.URL(), MaxRetries: -1}, nil)
+		Connect(context.Background(), &mcp.StreamableClientTransport{HTTPClient: bearerClient(testToken), Endpoint: h.URL(), MaxRetries: -1}, nil)
 	require.Error(t, err, "stopped server refuses connections")
 }
 
+func TestStopClosesConnectionsLeftAfterShutdownTimeout(t *testing.T) {
+	previous := httpShutdownTimeout
+	httpShutdownTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { httpShutdownTimeout = previous })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	_, stop := context.WithCancel(context.Background())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	// This handler ignores cancellation, as a stuck stream would.
+	h := startHTTP(ln, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(entered)
+		<-release
+	}), stop, slog.Default())
+
+	resp, err := http.Get("http://" + ln.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	<-entered
+
+	require.ErrorIs(t, h.Stop(), context.DeadlineExceeded)
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, resp.Body)
+		readDone <- err
+	}()
+	select {
+	case <-readDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream still open after Stop")
+	}
+}
+
 func TestStartRelayerMCPHTTPPanicOnProcessLog(t *testing.T) {
-	var logs bytes.Buffer
+	var logs syncBuffer
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
@@ -114,12 +152,14 @@ func TestStartRelayerMCPHTTPPanicOnProcessLog(t *testing.T) {
 	if resp != nil {
 		resp.Body.Close()
 	}
-	require.Contains(t, logs.String(), "http: panic serving")
-	require.Contains(t, logs.String(), marker)
+	// net/http logs the panic on its serve goroutine, possibly after Get returns.
+	require.Eventually(t, func() bool {
+		return strings.Contains(logs.String(), "http: panic serving") && strings.Contains(logs.String(), marker)
+	}, 2*time.Second, 10*time.Millisecond, "process log:\n%s", logs.String())
 }
 
 func TestStartRelayerMCPSessionLogOnProcessLog(t *testing.T) {
-	var logs bytes.Buffer
+	var logs syncBuffer
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
@@ -127,13 +167,13 @@ func TestStartRelayerMCPSessionLogOnProcessLog(t *testing.T) {
 	srv, err := New(&fakeChain{}, &fakeRelayer{}, Options{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = srv.Close() })
-	h, err := srv.ListenHTTP("127.0.0.1:0")
+	h, err := srv.ListenHTTP("127.0.0.1:0", testToken)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = h.Stop() })
 
 	ctx := context.Background()
 	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil).
-		Connect(ctx, &mcp.StreamableClientTransport{Endpoint: h.URL()}, nil)
+		Connect(ctx, &mcp.StreamableClientTransport{HTTPClient: bearerClient(testToken), Endpoint: h.URL()}, nil)
 	require.NoError(t, err)
 	require.NoError(t, cs.Close())
 
@@ -150,6 +190,74 @@ func TestRequireLoopback(t *testing.T) {
 
 	srv, err := New(&fakeChain{}, &fakeRelayer{}, Options{})
 	require.NoError(t, err)
-	_, err = srv.ListenHTTP("0.0.0.0:0")
+	_, err = srv.ListenHTTP("0.0.0.0:0", testToken)
 	require.ErrorContains(t, err, "not loopback")
+}
+
+// syncBuffer is a log target written by server goroutines and read by the test.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func TestStopEndsUnansweredApprovalPrompt(t *testing.T) {
+	previous := httpShutdownTimeout
+	httpShutdownTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { httpShutdownTimeout = previous })
+
+	chain := &fakeChain{}
+	srv, err := New(chain, &fakeRelayer{}, Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = srv.Close() })
+	h, err := srv.ListenHTTP("127.0.0.1:0", testToken)
+	require.NoError(t, err)
+
+	prompted := make(chan struct{})
+	var once sync.Once
+	release := make(chan struct{})
+	// An older client: the SDK sends the prompt itself. The user never answers.
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, &mcp.ClientOptions{
+		ElicitationHandler: func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			once.Do(func() { close(prompted) })
+			<-release
+			return &mcp.ElicitResult{Action: "decline"}, nil
+		},
+	})
+	ctx := context.Background()
+	cs, err := client.Connect(ctx,
+		&mcp.StreamableClientTransport{HTTPClient: bearerClient(testToken), Endpoint: h.URL(), MaxRetries: -1},
+		&mcp.ClientSessionOptions{ProtocolVersion: "2025-11-25"})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cs.Close() })
+	// Cleanups run last-in first-out: release the handler before the client
+	// close, which waits for it.
+	t.Cleanup(func() { close(release) })
+
+	go func() { _, _ = cs.CallTool(ctx, &mcp.CallToolParams{Name: "ibc_ift_send", Arguments: sendArgs("10")}) }()
+	select {
+	case <-prompted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("approval prompt not sent")
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- h.Stop() }()
+	select {
+	case <-stopped:
+	case <-time.After(4 * httpShutdownTimeout):
+		t.Fatal("Stop blocked on an unanswered approval prompt")
+	}
+	require.Zero(t, chain.sendCount(), "nothing is sent without an answer")
 }

@@ -44,4 +44,8 @@ type SendRequest struct {
 	From           string // signer alias
 	Timeout        time.Duration
 	ConfirmTimeout time.Duration
+	// OnReplaced, when set, is told each time the relayer re-signs the
+	// transfer at the same nonce with higher fees, including after IFTSend
+	// returned. Only one of the hashes can be mined.
+	OnReplaced func(previous, replacement string)
 }

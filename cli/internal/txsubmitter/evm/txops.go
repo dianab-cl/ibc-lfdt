@@ -193,7 +193,11 @@ func (c *TxSubmitter) prepareTransaction(
 		nil,
 	)
 	if err != nil {
-		return nil, errors.Wrap(chainsevm.ExplainRevert(err), "estimating gas")
+		explained := chainsevm.ExplainRevert(err)
+		if isRevert(err) {
+			explained = estimationReverted{explained}
+		}
+		return nil, errors.Wrap(explained, "estimating gas")
 	}
 	return &types.DynamicFeeTx{
 		ChainID:   c.ethSigner.ChainID(),
@@ -204,6 +208,30 @@ func (c *TxSubmitter) prepareTransaction(
 		GasFeeCap: fee,
 		GasTipCap: tip,
 	}, nil
+}
+
+// ErrEstimationReverted matches a submission whose gas estimate reverted.
+// Nothing was broadcast, and the same intent reverts again until chain state
+// changes, so callers should not report it as a transient RPC failure.
+var ErrEstimationReverted = errors.New("transaction reverts in simulation")
+
+// estimationReverted keeps the RPC error in the chain and adds
+// ErrEstimationReverted to it without changing the message.
+type estimationReverted struct{ error }
+
+func (e estimationReverted) Unwrap() error { return e.error }
+
+func (estimationReverted) Is(target error) bool { return target == ErrEstimationReverted }
+
+// isRevert reports whether an eth_estimateGas error is an EVM revert rather
+// than a transport or node failure. Geth reports a revert as JSON-RPC code 3.
+// Besu before 26.x uses -32000, so its message is matched instead.
+func isRevert(err error) bool {
+	var rpcErr rpc.Error
+	if errors.As(err, &rpcErr) && rpcErr.ErrorCode() == 3 {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "execution reverted")
 }
 
 // Round up by 20%, including when the previous tip was zero.

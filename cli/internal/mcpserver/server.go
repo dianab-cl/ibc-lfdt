@@ -14,7 +14,9 @@ import (
 	"log/slog"
 	"math/big"
 	"regexp"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -69,9 +71,6 @@ type Options struct {
 	Now func() time.Time
 	// PollInterval overrides how often a wait polls. Zero uses the default.
 	PollInterval time.Duration
-	// SkipConfirmation skips the approval prompt. Tests use it. The server asks
-	// before every send otherwise, because the endpoint has no authentication.
-	SkipConfirmation bool
 	// Audit records MCP writes. Nil discards them; tests do that. `ibc relayer run`
 	// opens the file before the server starts.
 	Audit *AuditLog
@@ -83,19 +82,32 @@ type Options struct {
 
 // Server holds the MCP server and the state behind its tools.
 type Server struct {
-	chain            ChainBackend
-	relayer          RelayerBackend
-	confirm          *confirmations
-	now              func() time.Time
-	mcp              *mcp.Server
-	confirmTimeout   time.Duration
-	waitDefault      time.Duration
-	waitMax          time.Duration
-	poll             time.Duration
+	chain          ChainBackend
+	relayer        RelayerBackend
+	confirm        *confirmations
+	now            func() time.Time
+	mcp            *mcp.Server
+	confirmTimeout time.Duration
+	waitDefault    time.Duration
+	waitMax        time.Duration
+	poll           time.Duration
+	// skipConfirmation skips the approval prompt. Only tests in this package
+	// set it, so no caller can build a server that sends without asking. The
+	// prompt shows the user each transfer; the bearer token, not the prompt,
+	// keeps other callers out.
 	skipConfirmation bool
 	audit            auditSink
 	toolCalls        metric.Int64Counter
 	knownTools       map[string]struct{}
+	// replaced groups the hashes of sends the relayer re-signed.
+	replaced replacements
+	// writes counts sends and relays that have an audit intent line and have
+	// not yet written their outcome. Close waits for them before closing the
+	// audit log. writesMu guards stopping and the Add side of writes.
+	writesMu    sync.Mutex
+	stopping    bool
+	stopStarted time.Time
+	writes      sync.WaitGroup
 	// shutdown cancels in-flight tool calls when the server stops.
 	shutdown context.Context
 	stop     context.CancelFunc
@@ -117,7 +129,7 @@ func New(chain ChainBackend, rel RelayerBackend, opts Options) (*Server, error) 
 	if err != nil {
 		return nil, fmt.Errorf("register mcp_tool_calls_total: %w", err)
 	}
-	shutdown, stop := context.WithCancel(context.Background())
+	shutdown, cancel := context.WithCancel(context.Background())
 	var audit auditSink
 	if opts.Audit != nil {
 		audit = opts.Audit
@@ -125,9 +137,20 @@ func New(chain ChainBackend, rel RelayerBackend, opts Options) (*Server, error) 
 	s := &Server{
 		chain: chain, relayer: rel, confirm: newConfirmations(now), now: now,
 		confirmTimeout: defaultConfirmTimeout, waitDefault: defaultWaitTimeout,
-		waitMax: maxWaitTimeout, poll: poll, skipConfirmation: opts.SkipConfirmation,
+		waitMax: maxWaitTimeout, poll: poll,
 		audit: audit, toolCalls: toolCalls, knownTools: map[string]struct{}{},
-		shutdown: shutdown, stop: stop,
+		shutdown: shutdown,
+	}
+	// stop is what HTTPServer.Stop and Close call. The first call starts the
+	// write drain's clock, so Close waits from the start of shutdown, not
+	// from when it is called.
+	s.stop = func() {
+		s.writesMu.Lock()
+		if s.stopStarted.IsZero() {
+			s.stopStarted = time.Now()
+		}
+		s.writesMu.Unlock()
+		cancel()
 	}
 
 	version := opts.Version
@@ -144,21 +167,90 @@ func New(chain ChainBackend, rel RelayerBackend, opts Options) (*Server, error) 
 		},
 	)
 	s.register()
-	s.mcp.AddReceivingMiddleware(s.observeToolCall)
+	// Both sit outside the SDK's multi round-trip middleware, which New added
+	// first. For a client older than 2026-07-28 that middleware sends the
+	// approval prompt itself with the request context, so bindRequest is what
+	// ends that wait when the server stops.
+	s.mcp.AddReceivingMiddleware(s.observeToolCall, s.recoverPanic, s.bindRequest)
 	return s, nil
+}
+
+// recoverPanic turns a panic in a handler into an error for that call. The
+// SDK runs handlers on its own goroutines without a recover, and this server
+// shares the relayer's process, so a panic would otherwise stop relaying too.
+func (s *Server) recoverPanic(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (res mcp.Result, err error) {
+		defer func() {
+			if v := recover(); v != nil {
+				slog.With("module", "mcp").Error("MCP handler panic",
+					"method", method, "panic", v, "stack", string(debug.Stack()))
+				res, err = nil, fmt.Errorf("internal error handling %s", method)
+			}
+		}()
+		return next(ctx, method, req)
+	}
+}
+
+// bindRequest ends a request's context when the server stops, including the
+// SDK's own elicitation wait, which does not run inside a tool handler.
+func (s *Server) bindRequest(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		ctx, cancel := s.bind(ctx)
+		defer cancel()
+		return next(ctx, method, req)
+	}
 }
 
 // MCP returns the underlying server, to run on a transport.
 func (s *Server) MCP() *mcp.Server { return s.mcp }
 
-// Close cancels in-flight tool calls and closes the audit log. The relayer
-// keeps its own state. The log lock covers a line that is still syncing.
+// writeDrainTimeout bounds how long, from the start of shutdown, Close waits
+// for running sends and relays to write their outcome line after their
+// context was cancelled. It is below httpShutdownTimeout, so when the HTTP
+// stop already used its whole deadline Close does not wait again, and MCP
+// stays within that one deadline.
+var writeDrainTimeout = 3 * time.Second
+
+// Close cancels in-flight tool calls, waits until writeDrainTimeout after
+// shutdown began for sends and relays to record how they ended, and closes
+// the audit log. A send that was broadcast still records its hash after
+// cancellation. The relayer keeps its own state. The log lock covers a line
+// that is still syncing.
 func (s *Server) Close() error {
 	s.stop()
+	s.writesMu.Lock()
+	s.stopping = true
+	deadline := s.stopStarted.Add(writeDrainTimeout)
+	s.writesMu.Unlock()
+	drained := make(chan struct{})
+	go func() {
+		s.writes.Wait()
+		close(drained)
+	}()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-drained:
+	case <-timer.C:
+		slog.With("module", "mcp").Warn(
+			"MCP write still running at shutdown; its outcome line may be missing from the audit log")
+	}
 	if s.audit == nil {
 		return nil
 	}
 	return s.audit.Close()
+}
+
+// beginWrite registers a send or relay that is about to write an audit
+// intent line. It refuses once Close has started.
+func (s *Server) beginWrite() bool {
+	s.writesMu.Lock()
+	defer s.writesMu.Unlock()
+	if s.stopping {
+		return false
+	}
+	s.writes.Add(1)
+	return true
 }
 
 // bind returns a context that ends when ctx ends or the server stops.
@@ -436,7 +528,7 @@ func (s *Server) iftSend(
 	}
 
 	w, ask, err := s.authorizeWrite(ctx, req, writeRequest{
-		action: "Send", chainID: in.ChainID, ift: in.IFT, from: in.From, to: in.To, amount: in.Amount,
+		chainID: in.ChainID, ift: in.IFT, from: in.From, to: in.To, amount: in.Amount,
 		clientID: in.ClientID, timeout: timeout, relay: relayMode,
 	})
 	if err != nil {
@@ -446,6 +538,10 @@ func (s *Server) iftSend(
 		return ask, SendOutput{}, nil
 	}
 
+	if !s.beginWrite() {
+		return s.rejectSend(in, relayMode, newError(CodeRelayerUnavailable, "the MCP server is stopping"))
+	}
+	defer s.writes.Done()
 	rec, err := s.beginAudit(auditRecord{
 		Tool: "ibc_ift_send", ChainID: in.ChainID, IFT: in.IFT, From: in.From, To: w.to,
 		Amount: w.amount.String(), ClientID: in.ClientID, Relay: relayMode,
@@ -457,6 +553,9 @@ func (s *Server) iftSend(
 	tx, err := s.chain.IFTSend(ctx, SendRequest{
 		ChainID: in.ChainID, IFT: in.IFT, ClientID: in.ClientID, To: w.to, Amount: w.amount,
 		From: in.From, Timeout: timeout, ConfirmTimeout: s.confirmTimeout,
+		OnReplaced: func(previous, replacement string) {
+			s.noteReplaced(rec, req, in.ChainID, previous, replacement)
+		},
 	})
 	// The approval was spent before this call. Keep the hash, once broadcast
 	// has returned one, so a later retry of the same approval can show it.
@@ -684,13 +783,17 @@ func (s *Server) relayTx(
 		return s.rejectRelay(in, newError(CodePolicyDenied, "chain %q has no connection on this relayer", in.ChainID))
 	}
 
+	if !s.beginWrite() {
+		return s.rejectRelay(in, newError(CodeRelayerUnavailable, "the MCP server is stopping"))
+	}
+	defer s.writes.Done()
 	rec, err := s.beginAudit(auditRecord{
 		Tool: "ibc_relay_tx", ChainID: in.ChainID, TxHash: in.TxHash,
 	})
 	if err != nil {
 		return nil, RelayOutput{}, err
 	}
-	packets, err := s.relayer.Relay(ctx, in.ChainID, in.TxHash, in.Packets)
+	packets, used, err := s.relayFamily(ctx, in)
 	if err != nil {
 		_ = s.finish(rec, asToolError(err, CodeRelayerError))
 		return nil, RelayOutput{}, asToolError(err, CodeRelayerError)
@@ -698,16 +801,42 @@ func (s *Server) relayTx(
 	if packets == nil {
 		packets = []ObservedPacket{}
 	}
-	next := relayNext(packets)
-	rec.Outcome = outcomeRelayed
-	if err := s.record(rec); err != nil {
-		return nil, RelayOutput{
-			Packets:  packets,
-			Warnings: []string{"audit log update failed: " + err.Error()},
-			Next:     next,
-		}, nil
+	out := RelayOutput{Packets: packets, Next: relayNext(packets)}
+	if note := replacedNote(in.TxHash, used); note != "" {
+		out.Warnings = append(out.Warnings, note)
 	}
-	return nil, RelayOutput{Packets: packets, Next: next}, nil
+	rec.Outcome = outcomeRelayed
+	rec.TxHash = used
+	if err := s.record(rec); err != nil {
+		out.Warnings = append(out.Warnings, "audit log update failed: "+err.Error())
+	}
+	return nil, out, nil
+}
+
+// relayFamily asks the relayer to deliver in.TxHash, or the hash of the same
+// transfer that was mined when the relayer re-signed it. It returns the hash
+// it relayed. Without replacements it is one Relay call.
+func (s *Server) relayFamily(ctx context.Context, in RelayInput) ([]ObservedPacket, string, error) {
+	hashes := s.replaced.family(in.TxHash)
+	if len(hashes) == 1 {
+		packets, err := s.relayer.Relay(ctx, in.ChainID, in.TxHash, in.Packets)
+		return packets, in.TxHash, err
+	}
+	var askedPackets []ObservedPacket
+	var askedErr error
+	for _, h := range hashes {
+		packets, err := s.relayer.Relay(ctx, in.ChainID, h, in.Packets)
+		if err == nil && len(packets) > 0 {
+			return packets, h, nil
+		}
+		if strings.EqualFold(h, in.TxHash) {
+			askedPackets, askedErr = packets, err
+		}
+		if ctx.Err() != nil {
+			return nil, in.TxHash, ctx.Err()
+		}
+	}
+	return askedPackets, in.TxHash, askedErr
 }
 
 // relayNext is the next step after a relay that returned. It waits only when
@@ -770,6 +899,23 @@ func (s *Server) getPackets(
 	if err != nil {
 		return nil, PacketsPage{}, asToolError(err, CodeRelayerError)
 	}
+	// A send the relayer re-signed: its packets are on whichever hash was mined.
+	if len(page.Packets) == 0 && in.SourceTxHash != "" && in.Cursor == "" {
+		for _, h := range s.replaced.family(in.SourceTxHash) {
+			if strings.EqualFold(h, in.SourceTxHash) {
+				continue
+			}
+			filter.SourceTxHash = h
+			other, err := s.relayer.Packets(ctx, filter, uint32(limit), "")
+			if err != nil {
+				return nil, PacketsPage{}, asToolError(err, CodeRelayerError)
+			}
+			if len(other.Packets) > 0 {
+				page = other
+				break
+			}
+		}
+	}
 	if page.Packets == nil {
 		page.Packets = []PacketStatus{}
 	}
@@ -791,7 +937,7 @@ func (s *Server) readPacketsResource(
 	if !ok || len(parts) != 2 || parts[0] == "" || !txHashPattern.MatchString(parts[1]) {
 		return nil, mcp.ResourceNotFoundError(uri)
 	}
-	packets, err := s.txPackets(ctx, parts[0], parts[1])
+	packets, _, err := s.txPackets(ctx, parts[0], parts[1])
 	if err != nil {
 		return nil, err
 	}
@@ -806,13 +952,15 @@ func (s *Server) readPacketsResource(
 
 // --- write authorization ---
 
+// writeRequest is an ibc_ift_send call before authorization. ibc_ift_send is
+// the only tool that signs.
 type writeRequest struct {
-	action, chainID, ift, from, to, amount string
-	// send only
-	clientID string
-	timeout  time.Duration
-	relay    string
+	chainID, ift, from, to, amount, clientID, relay string
+	timeout                                         time.Duration
 }
+
+// writeAction is the first approval field and the verb in the prompt.
+const writeAction = "Send"
 
 // authorizedWrite is a send the relayer's client signer may make.
 type authorizedWrite struct {
@@ -835,10 +983,12 @@ func (s *Server) authorizeWrite(
 		return authorizedWrite{}, nil, err
 	}
 	amount, ok := parseAmount(w.amount)
-	if !ok || amount.Sign() == 0 {
+	// ABI packing reduces a uint256 modulo 2^256, so a larger amount would be
+	// approved and audited as one number and sent as another.
+	if !ok || amount.Sign() == 0 || amount.BitLen() > 256 {
 		return authorizedWrite{}, nil, newError(
 			CodeInvalidArgument,
-			"amount %q must be a positive integer in base units",
+			"amount %q must be a positive integer in base units, at most 2^256-1",
 			w.amount,
 		)
 	}
@@ -862,7 +1012,7 @@ func (s *Server) authorizeWrite(
 
 	if !s.skipConfirmation {
 		fields := []string{
-			w.action,
+			writeAction,
 			w.chainID,
 			strings.ToLower(w.ift),
 			w.from,
@@ -940,21 +1090,18 @@ func (s *Server) askConfirmation(
 		shown = fmt.Sprintf("%s %s (%s base units)", formatUnits(amount, info.Decimals), info.Symbol, amount)
 	}
 	msg := fmt.Sprintf(
-		"%s %s of token %s on chain %s from signer %q to %s",
-		w.action,
+		"%s %s of token %s on chain %s from signer %q to %s, over client %s with a %s packet timeout, "+
+			"relay %s. Approve this transaction?",
+		writeAction,
 		shown,
 		w.ift,
 		w.chainID,
 		w.from,
 		to,
+		w.clientID,
+		w.timeout,
+		w.relay,
 	)
-	if w.clientID != "" {
-		msg += fmt.Sprintf(", over client %s with a %s packet timeout", w.clientID, w.timeout)
-	}
-	if w.relay != "" {
-		msg += fmt.Sprintf(", relay %s", w.relay)
-	}
-	msg += ". Approve this transaction?"
 
 	return &mcp.CallToolResult{
 		InputRequests: mcp.InputRequestMap{
@@ -983,6 +1130,17 @@ func (s *Server) checkConfirmation(req *mcp.CallToolRequest, fields []string) er
 	status := s.confirm.redeem(req.Params.RequestState, fields...)
 	if status == confirmUsed {
 		return spentApprovalError(s.confirm.spentTx(req.Params.RequestState))
+	}
+	if status == confirmOtherRun {
+		return newError(CodePolicyDenied,
+			"confirmation was issued before this relayer restarted, so whether it was used is not known; "+
+				"the transfer may already be broadcast. Ask the user before calling ibc_ift_send again.")
+	}
+	if status == confirmStale {
+		return newError(CodePolicyDenied,
+			"confirmation expired more than %s ago and this server no longer knows whether it was used; "+
+				"the transfer may already be broadcast. Ask the user before calling ibc_ift_send again.",
+			spentRetention)
 	}
 	if status != confirmAccepted {
 		// Mismatch and expiry did not spend the token.

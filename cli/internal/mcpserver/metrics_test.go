@@ -26,11 +26,11 @@ func TestToolCallMetrics(t *testing.T) {
 	})
 
 	srv, err := New(&fakeChain{}, &fakeRelayer{}, Options{
-		SkipConfirmation: true,
-		PollInterval:     time.Millisecond,
-		Meter:            provider.Meter("ibc.relayer"),
+		PollInterval: time.Millisecond,
+		Meter:        provider.Meter("ibc.relayer"),
 	})
 	require.NoError(t, err)
+	srv.skipConfirmation = true
 
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
 	serverSession, err := srv.MCP().Connect(ctx, serverTransport, nil)
@@ -119,4 +119,32 @@ func seriesValue(
 	}
 	require.FailNowf(t, "missing series", "tool=%s result=%s code=%s", tool, result, code)
 	return 0
+}
+
+func TestToolCallMetricsCountApprovalByProtocol(t *testing.T) {
+	// The SDK's multi round-trip middleware runs inside the metrics middleware.
+	// An older client is asked by the server within one call; a 2026-07-28
+	// client gets the approval request as a result and calls again.
+	for version, calls := range map[string]int64{"2025-11-25": 1, "2026-07-28": 2} {
+		t.Run(version, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+
+			h := newConfirmingHarness(t, clientOpts{
+				protocolVersion: version,
+				meter:           provider.Meter("ibc.relayer"),
+				elicit: func(*mcp.ElicitParams) (*mcp.ElicitResult, error) {
+					return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approve": true}}, nil
+				},
+			})
+			_, terr := h.call("ibc_ift_send", sendArgs("10"), nil)
+			require.Nil(t, terr)
+			require.Equal(t, 1, h.chain.sendCount())
+
+			points := collectToolCalls(t, reader)
+			require.Len(t, points, 1)
+			require.Equal(t, calls, seriesValue(t, points, "ibc_ift_send", "ok", ""))
+		})
+	}
 }

@@ -5,7 +5,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"log/slog"
 	"math/big"
 	"net"
@@ -119,69 +118,18 @@ func TestStartRelayerMCPLogsLifecycle(t *testing.T) {
 	t.Cleanup(func() { _ = stop() })
 	require.Contains(t, logs.String(), `msg="MCP server listening"`)
 	require.Contains(t, logs.String(), "url=http://127.0.0.1:")
+	tokenPath := filepath.Join(globalFlags.Home, mcpserver.TokenFileName)
+	require.Contains(t, logs.String(), "tokenFile="+tokenPath)
+	info, err := os.Stat(tokenPath)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	token, err := os.ReadFile(tokenPath)
+	require.NoError(t, err)
+	require.NotContains(t, logs.String(), strings.TrimSpace(string(token)), "the token is not logged")
 	require.NotContains(t, logs.String(), "MCP server stopped")
 
 	require.NoError(t, stop())
 	require.Contains(t, logs.String(), `msg="MCP server stopped"`)
-}
-
-func TestStartRelayerMCPStdoutOnProcessLog(t *testing.T) {
-	previous := globalFlags
-	t.Cleanup(func() {
-		globalFlags = previous
-		flagRelayerMCPListen = ""
-	})
-	globalFlags = config.DefaultFlagSet()
-	globalFlags.Home = t.TempDir()
-
-	// LevelError would swallow a normal slog.Info. Stdout bytes must still
-	// reach the handler the relayer installs on stderr.
-	var logs lockedBuffer
-	previousLog := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelError})))
-	t.Cleanup(func() { slog.SetDefault(previousLog) })
-
-	stop, err := startRelayerMCP(config.Config{MCP: config.MCPConfig{ListenAddr: "127.0.0.1:0"}},
-		relayer.UnimplementedRelayerApiServiceHandler{}, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = stop() })
-
-	// This is the write os.Stdout receives from fmt.Print and from the MCP Go
-	// SDK stdio transport. It must show up on the relayer logger, not only in
-	// the audit file.
-	const marker = "mcp-stdout-for-container-log"
-	_, err = fmt.Fprintln(os.Stdout, marker)
-	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		return strings.Contains(logs.String(), marker)
-	}, 2*time.Second, 10*time.Millisecond, "process log:\n%s", &logs)
-
-	audit, err := os.ReadFile(filepath.Join(globalFlags.Home, mcpserver.AuditFileName))
-	require.NoError(t, err)
-	require.NotContains(t, string(audit), marker)
-
-	require.NoError(t, stop())
-	_, err = fmt.Fprintln(os.Stdout, marker+"-after")
-	require.NoError(t, err)
-	require.NotContains(t, logs.String(), marker+"-after")
-}
-
-// lockedBuffer is a slog handler target the stdout copier and the test share.
-type lockedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (l *lockedBuffer) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.Write(p)
-}
-
-func (l *lockedBuffer) String() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.String()
 }
 
 func TestRedactRPC(t *testing.T) {
@@ -330,6 +278,21 @@ func TestSignerLockSerializes(t *testing.T) {
 		require.True(t, te.Retryable)
 		require.Nil(t, te.Tx)
 		require.NotContains(t, te.Error(), "http://")
+	})
+
+	t.Run("simulation revert is not retryable", func(t *testing.T) {
+		reverting := &nonceRPC{height: 100, baseFee: 100, tip: 10, gas: 100_000}
+		backend := agentBackend(t, reverting)
+		reverting.gasErr = errors.New("execution reverted: ERC20InsufficientBalance")
+		_, err := backend.IFTSend(ctx, sendReq("agent"))
+		requireToolError(t, err, mcpserver.CodeTxReverted, false, "")
+		require.Contains(t, err.Error(), "not broadcast")
+		require.Contains(t, err.Error(), "ERC20InsufficientBalance")
+		require.Empty(t, reverting.sentCopy())
+
+		reverting.gasErr = errors.New("header not found")
+		_, err = backend.IFTSend(ctx, sendReq("agent"))
+		requireToolError(t, err, mcpserver.CodeChainRPCError, true, "")
 	})
 
 	t.Run("refused dial is retryable", func(t *testing.T) {
@@ -505,6 +468,7 @@ type nonceRPC struct {
 	send              func(*types.Transaction) error
 	receipt           *types.Receipt
 	pendingNonceCalls int
+	gasErr            error
 }
 
 func (r *nonceRPC) record(tx *types.Transaction) {
@@ -545,7 +509,7 @@ func (r *nonceRPC) EstimateGasAtBlock(_ context.Context, _ ethereum.CallMsg, blo
 	if block != nil {
 		return 0, errors.New("expected mined state")
 	}
-	return r.gas, nil
+	return r.gas, r.gasErr
 }
 
 func (r *nonceRPC) NonceAt(_ context.Context, _ common.Address, block *big.Int) (uint64, error) {
