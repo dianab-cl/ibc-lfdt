@@ -31,10 +31,11 @@ const (
 // --- fakes ---
 
 type fakeChain struct {
-	mu        sync.Mutex
-	sends     []SendRequest
-	sendErr   error
-	autoRelay bool
+	mu         sync.Mutex
+	sends      []SendRequest
+	sendErr    error
+	autoRelay  bool
+	tokenReads int
 }
 
 func (f *fakeChain) Chains(context.Context) ([]ChainInfo, error) {
@@ -69,6 +70,9 @@ func (f *fakeChain) ResolveAddress(_ context.Context, v string) (string, error) 
 }
 
 func (f *fakeChain) TokenInfo(context.Context, string, string) (TokenInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tokenReads++
 	return TokenInfo{Symbol: "USDX", Decimals: 6}, nil
 }
 
@@ -158,6 +162,8 @@ type clientOpts struct {
 	protocolVersion string
 	// meter, when set, counts tool calls on the server.
 	meter metric.Meter
+	// tokens are the configured IFT tokens.
+	tokens []TokenRef
 }
 
 func newHarness(t *testing.T, co clientOpts) *harness {
@@ -180,7 +186,7 @@ func (h *harness) start(co clientOpts, skipConfirmation bool) {
 	srv, err := New(
 		h.chain,
 		h.relayer,
-		Options{PollInterval: 10 * time.Millisecond, Meter: co.meter},
+		Options{PollInterval: 10 * time.Millisecond, Meter: co.meter, Tokens: co.tokens},
 	)
 	require.NoError(t, err)
 	srv.skipConfirmation = skipConfirmation
@@ -257,8 +263,8 @@ func TestToolsAreListedWithHints(t *testing.T) {
 	for _, tool := range res.Tools {
 		tools[tool.Name] = tool
 	}
-	require.Len(t, tools, 6)
-	for _, name := range []string{"ibc_get_context", "ibc_ift_balance", "ibc_get_packets", "ibc_wait_for_packets"} {
+	require.Len(t, tools, 7)
+	for _, name := range []string{"ibc_get_context", "ibc_ift_balance", "ibc_list_sends", "ibc_get_packets", "ibc_wait_for_packets"} {
 		require.True(t, tools[name].Annotations.ReadOnlyHint, name)
 	}
 	require.False(t, tools["ibc_ift_send"].Annotations.ReadOnlyHint)
@@ -268,42 +274,22 @@ func TestToolsAreListedWithHints(t *testing.T) {
 	schema, err := json.Marshal(tools["ibc_ift_send"].InputSchema)
 	require.NoError(t, err)
 	require.Contains(t, string(schema), `"enum":["auto","always","never"]`)
-	require.Contains(t, string(schema), `"required":["chain_id","ift","client_id","to","amount","from"]`)
-	require.Equal(t,
-		"packet lifetime from now (default 900 seconds), not how long the tool waits for mining",
-		schemaDescription(t, tools["ibc_ift_send"].InputSchema, "timeout_seconds"),
-	)
-
-	require.Equal(t,
-		"the wait ended before done; this is not an error. If no packets have been seen, call ibc_relay_tx, then call ibc_wait_for_packets again. If packets are already moving, call ibc_wait_for_packets again. A not_selected packet does not wait out this timeout. Do not call ibc_ift_send again",
-		schemaDescription(t, tools["ibc_wait_for_packets"].OutputSchema, "timed_out"),
-	)
-	require.Equal(t,
-		"every packet reached the until condition, including ack, timeout, rejection, and relay failure. Read each packet state and summary before telling the user the transfer arrived. succeeded is the delivered state. timed_out, rejected, and relay_failed are finished and failed. Do not call ibc_ift_send again because a packet timed out or the wait timed out",
-		schemaDescription(t, tools["ibc_wait_for_packets"].OutputSchema, "done"),
-	)
+	require.Contains(t, string(schema), `"required":["chain_id","client_id","to","amount"]`)
+	require.Equal(t, "packet lifetime from now; default 900",
+		schemaDescription(t, tools["ibc_ift_send"].InputSchema, "packet_timeout_seconds"))
 
 	instructions := h.session.InitializeResult().Instructions
-	require.Contains(t, instructions, "After ibc_ift_send, follow the next field on the result.")
-	require.Contains(t, instructions,
-		"ibc_ift_send blocks until the user approves and the source tx is mined or the confirm timeout elapses. If the call is cancelled or the client times out and a transaction hash was returned, call ibc_get_packets with that hash as source_tx_hash. Do not call ibc_ift_send again. If no hash was returned, ask the user and do not call ibc_ift_send. TX_NOT_CONFIRMED is not retryable.",
-	)
-	require.NotContains(t, instructions, "or the user confirms the first one did not broadcast")
-	require.NotContains(t, tools["ibc_ift_send"].Description, "Follow delivery with ibc_wait_for_packets")
-	require.Contains(t, tools["ibc_ift_send"].Description, "does not return until the user accepts or declines")
+	require.Contains(t, instructions, "call next.tool with next.arguments")
+	require.Contains(t, instructions, "ibc_list_sends")
+	require.Contains(t, instructions, "TX_NOT_CONFIRMED is not retryable.")
 	require.Contains(t, tools["ibc_ift_send"].Description, "POLICY_DENIED")
-	require.Contains(t, tools["ibc_ift_send"].Description, "5 minutes")
-	require.Equal(t, 5*time.Minute, defaultConfirmTimeout)
-	require.Contains(t, tools["ibc_ift_send"].Description, "default 900 seconds")
-	require.NotContains(t, tools["ibc_ift_send"].Description, "timeout_seconds is how long the tool waits")
+	require.Contains(t, tools["ibc_ift_send"].Description, "returns once the tx is broadcast")
 
 	waitTimeout := schemaDescription(t, tools["ibc_wait_for_packets"].InputSchema, "timeout_seconds")
-	require.Contains(t, waitTimeout, "600")
+	require.Contains(t, waitTimeout, "45")
 	require.Contains(t, waitTimeout, "1800")
-	require.Equal(t, 600, int(defaultWaitTimeout.Seconds()))
+	require.Equal(t, 45, int(defaultWaitTimeout.Seconds()))
 	require.Equal(t, 1800, int(maxWaitTimeout.Seconds()))
-	require.NotContains(t, waitTimeout, "server config")
-	require.Contains(t, tools["ibc_wait_for_packets"].Description, "call ibc_wait_for_packets again, not ibc_ift_send")
 }
 
 func schemaDescription(t *testing.T, schema any, prop string) string {
@@ -338,6 +324,23 @@ func TestGetContextAppliesPolicy(t *testing.T) {
 
 	require.Equal(t, true, out["relayer"].(map[string]any)["ready"])
 	require.Equal(t, false, out["require_confirmation"])
+	require.Equal(t, true, out["can_send"], "no approval is needed")
+}
+
+func TestGetContextCanSend(t *testing.T) {
+	without := newConfirmingHarness(t, clientOpts{})
+	out, terr := without.call("ibc_get_context", nil, nil)
+	require.Nil(t, terr)
+	require.Equal(t, false, out["can_send"])
+	require.Contains(t, out["can_send_reason"], "elicitation")
+
+	with := newConfirmingHarness(t, clientOpts{elicit: func(*mcp.ElicitParams) (*mcp.ElicitResult, error) {
+		return &mcp.ElicitResult{Action: "accept"}, nil
+	}})
+	out, terr = with.call("ibc_get_context", nil, nil)
+	require.Nil(t, terr)
+	require.Equal(t, true, out["can_send"])
+	require.NotContains(t, out, "can_send_reason")
 }
 
 func TestBalance(t *testing.T) {
@@ -346,6 +349,7 @@ func TestBalance(t *testing.T) {
 	require.Nil(t, terr)
 	require.Equal(t, agentHex, out["address"])
 	require.Equal(t, "125000000", out["balance"])
+	require.Equal(t, "125 USDX", out["balance_display"])
 	require.Equal(t, "USDX", out["symbol"])
 }
 
@@ -370,7 +374,7 @@ func TestSendPolicyDenials(t *testing.T) {
 			a["from"] = "relayer-key"
 		}, CodePolicyDenied, "not configured on client"},
 		"relay":   {func(a map[string]any) { a["relay"] = "sometimes" }, "", "enum"},
-		"timeout": {func(a map[string]any) { a["timeout_seconds"] = 5 }, "", "minimum"},
+		"timeout": {func(a map[string]any) { a["packet_timeout_seconds"] = 5 }, "", "minimum"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -397,17 +401,14 @@ func TestSendRelaysUnlessAutoRelay(t *testing.T) {
 	require.Equal(t, 1, h.relayer.relayCount())
 	require.Equal(t, bobHex, h.chain.sends[0].To)
 	require.Equal(t, defaultSendTimeout, h.chain.sends[0].Timeout)
-	require.Equal(t, "Call ibc_wait_for_packets with this chain_id and tx_hash to follow delivery.", out["next"])
+	requireNext(t, out, "ibc_wait_for_packets", nextWait)
 
 	h.chain.autoRelay = true
 	out, terr = h.call("ibc_ift_send", sendArgs("100"), nil)
 	require.Nil(t, terr)
 	require.Equal(t, false, out["relay_requested"])
 	require.Equal(t, 1, h.relayer.relayCount(), "auto mode skips relay when the client auto-relays")
-	require.Equal(t,
-		"The relayer will pick the packet up. Call ibc_wait_for_packets with this chain_id and tx_hash.",
-		out["next"],
-	)
+	requireNext(t, out, "ibc_wait_for_packets", nextAutoRelay)
 
 	args := sendArgs("100")
 	args["relay"] = "always"
@@ -415,7 +416,7 @@ func TestSendRelaysUnlessAutoRelay(t *testing.T) {
 	require.Nil(t, terr)
 	require.Equal(t, 2, h.relayer.relayCount())
 	require.Equal(t, true, out["relay_requested"])
-	require.Equal(t, "Call ibc_wait_for_packets with this chain_id and tx_hash to follow delivery.", out["next"])
+	requireNext(t, out, "ibc_wait_for_packets", nextWait)
 
 	args = sendArgs("100")
 	args["relay"] = "never"
@@ -425,11 +426,7 @@ func TestSendRelaysUnlessAutoRelay(t *testing.T) {
 	require.Equal(t, txHash, out["tx"].(map[string]any)["tx_hash"])
 	require.Equal(t, false, out["relay_requested"])
 	require.Equal(t, 2, h.relayer.relayCount(), "relay=never does not call the relayer")
-	require.Equal(t,
-		"Delivery will not start until you call ibc_relay_tx with this chain_id and tx_hash. Waiting is not a substitute.",
-		out["next"],
-	)
-	require.NotContains(t, out["next"], "ibc_wait_for_packets")
+	requireNext(t, out, "ibc_relay_tx", nextNever)
 
 	h.chain.autoRelay = false
 	h.relayer.relayErr = errors.New("relay down")
@@ -439,9 +436,7 @@ func TestSendRelaysUnlessAutoRelay(t *testing.T) {
 	require.Equal(t, txHash, out["tx"].(map[string]any)["tx_hash"])
 	require.Contains(t, out["warnings"].([]any)[0], "tx is mined but the relay request failed")
 	require.Contains(t, out["warnings"].([]any)[0], "relay down")
-	require.Equal(t, "Call ibc_relay_tx with this chain_id and tx_hash. Do not wait first.", out["next"])
-	require.NotContains(t, out["next"], "ibc_wait_for_packets")
-	require.NotContains(t, out["next"], "ibc_ift_send")
+	requireNext(t, out, "ibc_relay_tx", nextRelayFailed)
 
 	h.relayer.relayErr = nil
 	h.relayer.relayPackets = []ObservedPacket{{
@@ -454,12 +449,7 @@ func TestSendRelaysUnlessAutoRelay(t *testing.T) {
 	require.Equal(t, true, out["relay_requested"])
 	require.Contains(t, out["warnings"].([]any)[0], "base-0/9")
 	require.Contains(t, out["warnings"].([]any)[0], "no route")
-	require.Equal(t,
-		"The source transfer is already mined. Do not call ibc_ift_send again. "+
-			"This relayer will not deliver packet base-0/9; it has no route on this relayer. Do not wait for this relayer to deliver it.",
-		out["next"],
-	)
-	requireMinedUnconfiguredNext(t, out["next"].(string))
+	requireNext(t, out, "", "The transfer is mined. This relayer has no route for packet base-0/9 and will not deliver it.")
 
 	h.relayer.relayPackets = []ObservedPacket{
 		{SourceClientID: "base-0", Sequence: "9", Selection: SelectionUnconfigured},
@@ -468,54 +458,48 @@ func TestSendRelaysUnlessAutoRelay(t *testing.T) {
 	out, terr = h.call("ibc_ift_send", sendArgs("100"), nil)
 	require.Nil(t, terr)
 	require.Contains(t, out["warnings"].([]any)[0], "base-0/9")
-	require.Equal(t,
-		"This relayer will not deliver packet base-0/9; it has no route on this relayer. Do not wait for this relayer to deliver it. "+
-			"Call ibc_wait_for_packets with this chain_id and tx_hash to follow delivery.",
-		out["next"],
-	)
+	requireNext(t, out, "ibc_wait_for_packets",
+		"This relayer has no route for packet base-0/9 and will not deliver it. "+nextWait)
+}
+
+// requireNext checks out's next step; a tool step targets chainA and txHash.
+func requireNext(t *testing.T, out map[string]any, tool, reason string) {
+	t.Helper()
+	next := out["next"].(map[string]any)
+	require.Equal(t, reason, next["reason"])
+	if tool == "" {
+		require.NotContains(t, next, "tool")
+		require.NotContains(t, next, "arguments")
+		return
+	}
+	require.Equal(t, tool, next["tool"])
+	require.Equal(t, map[string]any{"chain_id": chainA, "tx_hash": txHash}, next["arguments"])
 }
 
 func TestSendNextAllUnconfiguredNamesNoFollowUp(t *testing.T) {
 	one := []ObservedPacket{{
 		SourceClientID: "base-0", Sequence: "9", Selection: SelectionUnconfigured,
 	}}
-	want := "The source transfer is already mined. Do not call ibc_ift_send again. " +
-		"This relayer will not deliver packet base-0/9; it has no route on this relayer. Do not wait for this relayer to deliver it."
+	want := NextStep{Reason: "The transfer is mined. This relayer has no route for packet base-0/9 and will not deliver it."}
 	for _, mode := range []string{relayAuto, relayAlways, relayNever} {
-		got := sendNext(mode, true, false, false, one)
-		require.Equal(t, want, got)
-		requireMinedUnconfiguredNext(t, got)
+		require.Equal(t, want, sendNext(mode, true, false, false, one))
 	}
 	// A relay failure does not add a follow-up tool when every packet is unconfigured.
-	failed := sendNext(relayAlways, false, true, false, one)
-	require.Equal(t, want, failed)
-	requireMinedUnconfiguredNext(t, failed)
+	require.Equal(t, want, sendNext(relayAlways, false, true, false, one))
 
 	two := sendNext(relayAuto, true, false, false, []ObservedPacket{
 		{SourceClientID: "base-0", Sequence: "9", Selection: SelectionUnconfigured},
 		{SourceClientID: "base-1", Sequence: "3", Selection: SelectionUnconfigured},
 	})
-	require.Contains(t, two, "already mined")
-	require.Contains(t, two, "packets base-0/9, base-1/3")
-	requireMinedUnconfiguredNext(t, two)
+	require.Empty(t, two.Tool)
+	require.Contains(t, two.Reason, "packets base-0/9, base-1/3")
 
 	mixed := sendNext(relayAuto, true, false, false, []ObservedPacket{
 		{SourceClientID: "base-0", Sequence: "9", Selection: SelectionUnconfigured},
 		{SourceClientID: "base-0", Sequence: "10", Selection: SelectionSelected},
 	})
-	require.Contains(t, mixed, "ibc_wait_for_packets")
-	require.NotContains(t, mixed, "already mined")
-}
-
-func requireMinedUnconfiguredNext(t *testing.T, next string) {
-	t.Helper()
-	require.Contains(t, next, "already mined")
-	require.Contains(t, next, "Do not call ibc_ift_send")
-	require.Contains(t, next, "no route")
-	require.NotContains(t, next, "Call ibc_ift_send")
-	require.NotContains(t, next, "ibc_wait_for_packets")
-	require.NotContains(t, next, "ibc_relay_tx")
-	require.NotContains(t, next, "ibc_get_packets")
+	require.Equal(t, toolWait, mixed.Tool)
+	require.NotContains(t, mixed.Reason, "is mined")
 }
 
 func TestSendReportsUnconfirmedTx(t *testing.T) {
@@ -882,9 +866,7 @@ func TestWaitForPacketsReportsProgress(t *testing.T) {
 	p := out["packets"].([]any)[0].(map[string]any)
 	require.Equal(t, "succeeded", p["state"])
 	require.Equal(t, "0xack", p["ack_tx"].(map[string]any)["tx_hash"])
-	require.Equal(t, waitDoneHint, out["hint"])
-	require.NotContains(t, out["hint"], "call ibc_ift_send again.")
-	require.Contains(t, out["hint"], "Do not call ibc_ift_send again")
+	requireNext(t, out, "", waitDoneHint)
 
 	require.Eventually(t, func() bool {
 		h.mu.Lock()
@@ -911,16 +893,19 @@ func TestWaitTimesOutWithHint(t *testing.T) {
 	cases := []struct {
 		name   string
 		script [][]PacketStatus
+		tool   string
 		hint   string
 	}{
 		{
 			name:   "no packets",
 			script: nil,
+			tool:   toolRelay,
 			hint:   waitNoPacketsHint,
 		},
 		{
 			name:   "moving",
 			script: [][]PacketStatus{{packet(StatePending, false)}},
+			tool:   toolWait,
 			hint:   waitMovingHint,
 		},
 	}
@@ -935,8 +920,7 @@ func TestWaitTimesOutWithHint(t *testing.T) {
 			require.Nil(t, terr, "a wait timeout is not an error")
 			require.Equal(t, false, out["done"])
 			require.Equal(t, true, out["timed_out"])
-			require.Equal(t, tc.hint, out["hint"])
-			require.Contains(t, out["hint"], "Do not call ibc_ift_send again")
+			requireNext(t, out, tc.tool, tc.hint)
 		})
 	}
 }
@@ -959,7 +943,7 @@ func TestWaitTimeoutBoundsSlowRelayerQuery(t *testing.T) {
 	require.Less(t, time.Since(start), 3*time.Second, "the query is bound by timeout_seconds")
 	require.Nil(t, terr, "a wait timeout is not an error")
 	require.Equal(t, true, out["timed_out"])
-	require.Equal(t, waitMovingHint, out["hint"])
+	requireNext(t, out, toolWait, waitMovingHint)
 	require.Len(t, out["packets"], 1, "the last answered poll is reported")
 }
 
@@ -988,12 +972,11 @@ func TestWaitNotSelectedReturnsImmediately(t *testing.T) {
 	require.Less(t, time.Since(start), time.Second)
 	require.False(t, out.Done)
 	require.False(t, out.TimedOut)
-	require.Equal(t, waitNotSelectedHint, out.Hint)
+	require.Equal(t, NextStep{
+		Tool: toolRelay, Arguments: map[string]string{"chain_id": chainA, "tx_hash": txHash}, Reason: waitNotSelectedHint,
+	}, out.Next)
 	require.Equal(t, 1, out.Summary.Pending)
 	require.Equal(t, 1, out.Summary.NotSelected)
-	require.Contains(t, out.Hint, "Call ibc_relay_tx")
-	require.Contains(t, out.Hint, "ibc_wait_for_packets")
-	require.Contains(t, out.Hint, "Do not call ibc_ift_send")
 }
 
 func TestWaitCancelIsToolError(t *testing.T) {
@@ -1022,8 +1005,8 @@ func TestWaitCancelIsToolError(t *testing.T) {
 	})
 	var te *ToolError
 	require.ErrorAs(t, err, &te)
-	require.Equal(t, CodeRelayerError, te.Code)
-	require.False(t, te.Retryable)
+	require.Equal(t, CodeRelayerUnavailable, te.Code)
+	require.True(t, te.Retryable, "waiting again is a read")
 	require.Equal(t, waitCanceledMessage, te.Message)
 	require.Contains(t, te.Message, "Call ibc_wait_for_packets again")
 	require.Contains(t, te.Message, "not ibc_ift_send")
@@ -1031,9 +1014,9 @@ func TestWaitCancelIsToolError(t *testing.T) {
 	require.NotContains(t, err.Error(), "context canceled")
 	var raw map[string]any
 	require.NoError(t, json.Unmarshal([]byte(err.Error()), &raw))
-	require.Equal(t, string(CodeRelayerError), raw["code"])
+	require.Equal(t, string(CodeRelayerUnavailable), raw["code"])
 	require.Equal(t, waitCanceledMessage, raw["message"])
-	require.Equal(t, false, raw["retryable"])
+	require.Equal(t, true, raw["retryable"])
 
 	kept := waitCancelError(NewError(CodeRelayerUnavailable, "connection refused"))
 	require.True(t, kept.Retryable)
@@ -1041,10 +1024,9 @@ func TestWaitCancelIsToolError(t *testing.T) {
 	rpc := waitCancelError(NewError(CodeChainRPCError, "timeout"))
 	require.True(t, rpc.Retryable)
 	plain := waitCancelError(context.DeadlineExceeded)
-	require.False(t, plain.Retryable)
-	require.NotEqual(t, CodeChainRPCError, plain.Code)
-	require.NotEqual(t, CodeRelayerUnavailable, plain.Code)
-	require.Equal(t, waitCanceledMessage, plain.Message)
+	require.True(t, plain.Retryable)
+	require.Equal(t, CodeRelayerUnavailable, plain.Code)
+	require.Equal(t, waitCanceledMessage, plain.Message, "a context error gets the cancel message, not its own text")
 }
 
 func TestWaitDoneReadsTerminalFailure(t *testing.T) {
@@ -1058,9 +1040,7 @@ func TestWaitDoneReadsTerminalFailure(t *testing.T) {
 	require.Equal(t, true, out["done"])
 	require.Equal(t, false, out["timed_out"])
 	require.InDelta(t, 1, out["summary"].(map[string]any)["timed_out"], 0)
-	require.Equal(t, waitDoneHint, out["hint"])
-	require.Contains(t, out["hint"], "succeeded is the delivered state")
-	require.Contains(t, out["hint"], "Do not call ibc_ift_send again")
+	requireNext(t, out, "", waitDoneHint)
 }
 
 func TestReadValidation(t *testing.T) {
@@ -1122,62 +1102,46 @@ func TestRelayNextDoesNotWaitWhenNothingQueued(t *testing.T) {
 		{SourceClientID: "base-0", Sequence: "1", Selection: SelectionNotSelected},
 		{SourceClientID: "base-0", Sequence: "2", Selection: SelectionNotSelected},
 	}
-	for _, packets := range [][]ObservedPacket{notSelected, {}} {
-		got := sendNext(relayAuto, true, false, false, packets)
-		require.NotContains(t, got, "ibc_wait_for_packets")
-		require.Contains(t, got, "ibc_relay_tx")
-		require.NotContains(t, got, "ibc_ift_send")
-	}
+	require.Equal(t, NextStep{Tool: toolRelay, Reason: nextNotSelected}, sendNext(relayAuto, true, false, false, notSelected))
+	require.Equal(t, NextStep{Tool: toolRelay, Reason: nextNoPackets}, sendNext(relayAuto, true, false, false, nil))
 	selected := sendNext(relayAuto, true, false, false, []ObservedPacket{
 		{SourceClientID: "base-0", Sequence: "1", Selection: SelectionNotSelected},
 		{SourceClientID: "base-0", Sequence: "2", Selection: SelectionSelected},
 	})
-	require.Contains(t, selected, "ibc_wait_for_packets")
+	require.Equal(t, toolWait, selected.Tool)
 
 	h := newHarness(t, clientOpts{})
+	relay := func() map[string]any {
+		out, terr := h.call("ibc_relay_tx", map[string]any{"chain_id": chainA, "tx_hash": txHash}, nil)
+		require.Nil(t, terr)
+		return out
+	}
 	h.relayer.relayPackets = notSelected
-	out, terr := h.call("ibc_relay_tx", map[string]any{"chain_id": chainA, "tx_hash": txHash}, nil)
-	require.Nil(t, terr)
-	require.NotContains(t, out["next"], "ibc_wait_for_packets")
-	require.Contains(t, out["next"], "not_selected")
-	require.Contains(t, out["next"], "ibc_relay_tx")
+	requireNext(t, relay(), toolRelay, nextNotSelected)
 
 	h.relayer.relayPackets = []ObservedPacket{}
-	out, terr = h.call("ibc_relay_tx", map[string]any{"chain_id": chainA, "tx_hash": txHash}, nil)
-	require.Nil(t, terr)
-	require.NotContains(t, out["next"], "ibc_wait_for_packets")
-	require.Contains(t, out["next"], "no packets")
-	require.Contains(t, out["next"], "ibc_relay_tx")
+	requireNext(t, relay(), toolRelay, nextNoPackets)
 
 	h.relayer.relayPackets = []ObservedPacket{{
 		SourceClientID: "base-0", Sequence: "9", Selection: SelectionUnconfigured,
 	}}
-	out, terr = h.call("ibc_relay_tx", map[string]any{"chain_id": chainA, "tx_hash": txHash}, nil)
-	require.Nil(t, terr)
-	requireMinedUnconfiguredNext(t, out["next"].(string))
-	require.Contains(t, out["next"], "base-0/9")
+	requireNext(t, relay(), "", "The transfer is mined. This relayer has no route for packet base-0/9 and will not deliver it.")
 
 	h.relayer.relayPackets = []ObservedPacket{
 		{SourceClientID: "base-0", Sequence: "1", Selection: SelectionNotSelected},
 		{SourceClientID: "base-0", Sequence: "2", Selection: SelectionSelected},
 	}
-	out, terr = h.call("ibc_relay_tx", map[string]any{"chain_id": chainA, "tx_hash": txHash}, nil)
-	require.Nil(t, terr)
-	require.Contains(t, out["next"], "ibc_wait_for_packets")
+	requireNext(t, relay(), toolWait, nextWait)
 
 	h.relayer.relayPackets = notSelected
-	out, terr = h.call("ibc_ift_send", sendArgs("100"), nil)
+	out, terr := h.call("ibc_ift_send", sendArgs("100"), nil)
 	require.Nil(t, terr)
-	require.NotContains(t, out["next"], "ibc_wait_for_packets")
-	require.Contains(t, out["next"], "not_selected")
-	require.Contains(t, out["next"], "ibc_relay_tx")
+	requireNext(t, out, toolRelay, nextNotSelected)
 
 	h.relayer.relayPackets = []ObservedPacket{}
 	out, terr = h.call("ibc_ift_send", sendArgs("100"), nil)
 	require.Nil(t, terr)
-	require.NotContains(t, out["next"], "ibc_wait_for_packets")
-	require.Contains(t, out["next"], "no packets")
-	require.Contains(t, out["next"], "ibc_relay_tx")
+	requireNext(t, out, toolRelay, nextNoPackets)
 }
 
 type loopCursorRelayer struct{}
@@ -1228,4 +1192,37 @@ func TestHandlerPanicIsAnErrorNotACrash(t *testing.T) {
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ibc_get_context"})
 	require.NoError(t, err, "the server keeps serving after a handler panic")
 	require.False(t, res.IsError)
+}
+
+// Waits over the cap queue without polling the relayer, and a wait that never
+// gets a slot returns a timed-out result that says to wait again.
+func TestWaitCapQueuesWithoutPolling(t *testing.T) {
+	relayer := &fakeRelayer{script: [][]PacketStatus{{packet(StateSucceeded, true)}}}
+	srv, err := New(&fakeChain{}, relayer, Options{PollInterval: 10 * time.Millisecond})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = srv.Close() })
+	srv.waitSlots = make(chan struct{}, 1)
+	srv.waitSlots <- struct{}{} // another wait holds the only slot
+
+	in := WaitInput{ChainID: chainA, TxHash: txHash, TimeoutSeconds: 1}
+	_, out, err := srv.waitForPackets(context.Background(), &mcp.CallToolRequest{}, in)
+	require.NoError(t, err)
+	require.True(t, out.TimedOut)
+	require.False(t, out.Done)
+	require.Equal(t, NextStep{
+		Tool: toolWait, Arguments: map[string]string{"chain_id": chainA, "tx_hash": txHash}, Reason: waitBusyHint,
+	}, out.Next)
+	relayer.mu.Lock()
+	require.Zero(t, relayer.polls, "a queued wait does not poll")
+	relayer.mu.Unlock()
+
+	// A slot freed while queued is taken, and released when the wait returns.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		<-srv.waitSlots
+	}()
+	_, out, err = srv.waitForPackets(context.Background(), &mcp.CallToolRequest{}, in)
+	require.NoError(t, err)
+	require.True(t, out.Done)
+	require.Empty(t, srv.waitSlots, "the slot is released")
 }

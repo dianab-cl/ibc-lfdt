@@ -148,7 +148,7 @@ func TestRelayNotFoundIsRetryable(t *testing.T) {
 
 	_, err := api.Relay(context.Background(), "1", txHash, nil)
 	te := asToolError(err, "")
-	require.Equal(t, CodeInvalidArgument, te.Code)
+	require.Equal(t, CodePacketsNotFound, te.Code)
 	require.True(t, te.Retryable)
 	require.Contains(t, te.Message, "no packets found")
 	require.Contains(t, te.Message, "Retry ibc_relay_tx")

@@ -167,10 +167,11 @@ func (c *TxSubmitter) Submit(ctx context.Context, intent v2.TxIntent) (_ *v2.Sub
 	return sub, nil
 }
 
-// Confirm broadcasts intent at a reserved nonce, awaits it off c.mu, re-signs stalls (onReplace).
-// A non-empty hash with an error may have landed: report it, never treat it as no transaction.
+// Confirm broadcasts intent at a reserved nonce (onBroadcast gets the hash), awaits it off c.mu
+// and re-signs stalls (onReplace). A hash with an error may have landed: report it.
 func (c *TxSubmitter) Confirm(
-	ctx context.Context, intent v2.TxIntent, confirmTimeout time.Duration, onReplace ReplaceFunc,
+	ctx context.Context, intent v2.TxIntent, confirmTimeout time.Duration,
+	onBroadcast func(hash string), onReplace ReplaceFunc,
 ) (hash string, receipt *types.Receipt, err error) {
 	defer func() {
 		metrics.attempt(ctx, c.chainID, c.address.Hex(), err)
@@ -206,6 +207,9 @@ func (c *TxSubmitter) Confirm(
 	// Other submissions can use later nonces while this receipt is outstanding.
 	// confirmReserved keeps them off this nonce until the node reports it free.
 	c.mu.Unlock()
+	if onBroadcast != nil {
+		onBroadcast(hash)
+	}
 	hash, receipt, err = c.waitReceipt(ctx, reserved, hash)
 	c.mu.Lock()
 	defer c.mu.Unlock()

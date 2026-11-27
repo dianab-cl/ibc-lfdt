@@ -1455,3 +1455,15 @@ mcp:
 		require.NoError(t, cfg.Validate())
 	})
 }
+
+func TestMCPTokens(t *testing.T) {
+	cfg := loadSampleConfig(t)
+	cfg.MCP.Tokens = []MCPToken{{ChainID: cfg.Chains[0].ChainID, IFT: "0x00000000000000000000000000000000000000aA"}}
+	require.NoError(t, cfg.Validate())
+
+	cfg.MCP.Tokens[0].IFT = "not-an-address"
+	require.ErrorContains(t, cfg.Validate(), "not a hex address")
+
+	cfg.MCP.Tokens[0] = MCPToken{ChainID: "404", IFT: "0x00000000000000000000000000000000000000aA"}
+	require.ErrorContains(t, cfg.Validate(), "not declared")
+}

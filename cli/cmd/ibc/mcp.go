@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	stdErrors "errors"
-	"log/slog"
 	"math/big"
 	"net/url"
 	"path/filepath"
@@ -45,6 +44,9 @@ var rpcURLPattern = regexp.MustCompile(`https?://\S+`)
 type evmBackend struct {
 	cfg        config.Config
 	submitters *txsubmitter.Set
+	mu         sync.Mutex
+	clients    map[string]*ethclient.Client // by chain ID
+	closed     bool
 }
 
 // startRelayerMCP starts the MCP server on its own port, calling the relayer
@@ -57,7 +59,7 @@ func startRelayerMCP(
 		listen = cfg.MCP.ListenAddr
 	}
 	if listen == "" {
-		slog.Debug("MCP server not started: no listen address")
+		mcpserver.Logger().Debug("MCP server not started: no listen address")
 		return nil, nil
 	}
 
@@ -81,15 +83,17 @@ func startRelayerMCP(
 		return nil, err
 	}
 
+	backend := &evmBackend{cfg: cfg, submitters: submitters}
 	srv, err := mcpserver.New(
-		&evmBackend{cfg: cfg, submitters: submitters},
+		backend,
 		mcpserver.NewRelayerAPI(api),
 		mcpserver.Options{
 			Version: version,
 			Audit:   audit,
 			// Counts share the relayer meter. Observability already owns the
 			// scrape listener; this does not open another.
-			Meter: otel.Meter("relayer"),
+			Meter:  otel.Meter("relayer"),
+			Tokens: mcpTokens(cfg.MCP.Tokens),
 		},
 	)
 	if err != nil {
@@ -104,22 +108,32 @@ func startRelayerMCP(
 
 	// stderr, via slog. The container image runs /opt/ibc with no log redirect,
 	// so docker logs and kubectl logs are this stream. The audit file is not.
-	slog.Info("MCP server listening", "url", h.URL(), "tokenFile", tokenPath)
+	mcpserver.Logger().Info("MCP server listening", "url", h.URL(), "tokenFile", tokenPath)
 
 	var once sync.Once
 	var stopErr error
 	return func() error {
 		once.Do(func() {
 			stopErr = stdErrors.Join(h.Stop(), srv.Close())
+			backend.Close()
 			if stopErr != nil {
-				slog.Error("MCP server stopped", "err", stopErr)
+				mcpserver.Logger().Error("MCP server stopped", "err", stopErr)
 				stopErr = errors.Wrap(stopErr, "stop MCP server")
 				return
 			}
-			slog.Info("MCP server stopped")
+			mcpserver.Logger().Info("MCP server stopped")
 		})
 		return stopErr
 	}, nil
+}
+
+// mcpTokens converts mcp.tokens for the server.
+func mcpTokens(tokens []config.MCPToken) []mcpserver.TokenRef {
+	out := make([]mcpserver.TokenRef, 0, len(tokens))
+	for _, t := range tokens {
+		out = append(out, mcpserver.TokenRef{ChainID: t.ChainID, IFT: common.HexToAddress(t.IFT).Hex()})
+	}
+	return out
 }
 
 // mcpHomePath resolves an MCP file setting against home; empty means defaultName.
@@ -191,11 +205,10 @@ func (b *evmBackend) ResolveAddress(_ context.Context, value string) (string, er
 }
 
 func (b *evmBackend) TokenInfo(ctx context.Context, chainID, iftAddr string) (mcpserver.TokenInfo, error) {
-	contract, closeClient, err := b.openIFT(ctx, chainID, iftAddr)
+	contract, err := b.openIFT(ctx, chainID, iftAddr)
 	if err != nil {
 		return mcpserver.TokenInfo{}, err
 	}
-	defer closeClient()
 
 	opts := &bind.CallOpts{Context: ctx}
 	symbol, err := contract.Symbol(opts)
@@ -210,11 +223,10 @@ func (b *evmBackend) TokenInfo(ctx context.Context, chainID, iftAddr string) (mc
 }
 
 func (b *evmBackend) IFTBalance(ctx context.Context, chainID, iftAddr, address string) (*big.Int, error) {
-	contract, closeClient, err := b.openIFT(ctx, chainID, iftAddr)
+	contract, err := b.openIFT(ctx, chainID, iftAddr)
 	if err != nil {
 		return nil, err
 	}
-	defer closeClient()
 
 	bal, err := contract.BalanceOf(&bind.CallOpts{Context: ctx}, common.HexToAddress(address))
 	if err != nil {
@@ -236,12 +248,17 @@ func (b *evmBackend) IFTSend(ctx context.Context, req mcpserver.SendRequest) (mc
 	var onReplace evmsub.ReplaceFunc
 	if req.OnReplaced != nil {
 		onReplace = func(previous, replacement string) {
-			slog.Warn("MCP tx re-signed at the same nonce", "chain", req.ChainID,
+			mcpserver.Logger().Warn("MCP tx re-signed at the same nonce", "chain", req.ChainID,
 				"previousTx", previous, "tx", replacement, "from", req.From)
 			req.OnReplaced(previous, replacement)
 		}
 	}
-	hash, receipt, err := submitter.Confirm(ctx, v2.TxIntent{To: req.IFT, Data: data}, req.ConfirmTimeout, onReplace)
+	var onBroadcast func(string)
+	if req.OnBroadcast != nil {
+		onBroadcast = func(hash string) { req.OnBroadcast(mcpserver.TxRef{ChainID: req.ChainID, TxHash: hash}) }
+	}
+	hash, receipt, err := submitter.Confirm(
+		ctx, v2.TxIntent{To: req.IFT, Data: data}, req.ConfirmTimeout, onBroadcast, onReplace)
 	if hash == "" {
 		if err == nil {
 			err = stdErrors.New("no transaction")
@@ -250,20 +267,22 @@ func (b *evmBackend) IFTSend(ctx context.Context, req mcpserver.SendRequest) (mc
 		// again until chain state changes, so it is not retryable.
 		if stdErrors.Is(err, evmsub.ErrEstimationReverted) {
 			return mcpserver.TxRef{}, mcpserver.NewError(mcpserver.CodeTxReverted,
-				"transfer reverts in simulation and was not broadcast: %s", redactRPC(err))
+				"transfer reverts in simulation and was not broadcast: %s. Check the signer's balance with ibc_ift_balance; "+
+					"retrying fails until the cause changes", redactRPC(err))
 		}
 		// Any other failure before broadcast may be transient. The agent may retry.
 		return mcpserver.TxRef{}, mcpserver.NewError(mcpserver.CodeChainRPCError, "submit: %s", redactRPC(err))
 	}
 	ref := mcpserver.TxRef{ChainID: req.ChainID, TxHash: hash}
-	slog.Info("MCP tx broadcast", "chain", req.ChainID, "tx", ref.TxHash, "from", req.From)
+	mcpserver.Logger().Info("MCP tx broadcast", "chain", req.ChainID, "tx", ref.TxHash, "from", req.From)
 	if err != nil {
 		return mcpserver.TxRef{}, mcpserver.NewTxError(mcpserver.CodeTxNotConfirmed, ref,
-			"tx broadcast but not mined within %s: %s; check the hash before resending",
+			"tx broadcast but not mined within %s: %s. It may still mine: follow it with ibc_relay_tx or ibc_get_packets "+
+				"using this hash, and do not call ibc_ift_send again",
 			req.ConfirmTimeout, redactRPC(err))
 	}
 	if receipt == nil || receipt.Status != types.ReceiptStatusSuccessful {
-		return mcpserver.TxRef{}, mcpserver.NewTxError(mcpserver.CodeTxReverted, ref, "tx %s reverted", ref.TxHash)
+		return mcpserver.TxRef{}, mcpserver.NewTxError(mcpserver.CodeTxReverted, ref, "tx %s reverted; no tokens moved. Ask the user before sending again", ref.TxHash)
 	}
 	return ref, nil
 }
@@ -286,7 +305,7 @@ func (b *evmBackend) evmSubmitter(chainID, signerAlias string) (*evmsub.TxSubmit
 	s, ok := b.submitters.Get(chainID, signerAlias)
 	if !ok {
 		return nil, mcpserver.NewError(mcpserver.CodePolicyDenied,
-			"signer %q is not configured to submit on chain %q", signerAlias, chainID)
+			"signer %q is not configured to submit on chain %q; omit from to use the client's signer", signerAlias, chainID)
 	}
 	concrete, ok := s.(*evmsub.TxSubmitter)
 	if !ok {
@@ -304,20 +323,30 @@ func packIFTTransfer(clientID, receiver string, amount *big.Int, timeout uint64)
 	return parsed.Pack("iftTransfer", clientID, receiver, amount, timeout)
 }
 
-// openIFT dials chainID and binds the IFT contract. The caller closes the client.
-func (b *evmBackend) openIFT(ctx context.Context, chainID, iftAddr string) (*ift.Contract, func(), error) {
+// openIFT binds the IFT contract on chainID's shared client.
+func (b *evmBackend) openIFT(ctx context.Context, chainID, iftAddr string) (*ift.Contract, error) {
 	client, err := b.dial(ctx, chainID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	contract, err := ift.NewContract(common.HexToAddress(iftAddr), client)
 	if err != nil {
-		client.Close()
-		return nil, nil, errors.Wrap(err, "opening IFT contract")
+		return nil, errors.Wrap(err, "opening IFT contract")
 	}
-	return contract, client.Close, nil
+	return contract, nil
 }
 
+// Close closes the RPC clients dial opened; later dials fail.
+func (b *evmBackend) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, c := range b.clients {
+		c.Close()
+	}
+	b.clients, b.closed = nil, true
+}
+
+// dial returns chainID's RPC client, opened once and shared by every read.
 func (b *evmBackend) dial(ctx context.Context, chainID string) (*ethclient.Client, error) {
 	chain, ok := b.cfg.Chain(chainID)
 	if !ok {
@@ -326,11 +355,35 @@ func (b *evmBackend) dial(ctx context.Context, chainID string) (*ethclient.Clien
 	if chain.Type() != config.ChainTypeEVM {
 		return nil, mcpserver.NewError(mcpserver.CodeConfigError, "chain %q is not an EVM chain", chainID)
 	}
+	b.mu.Lock()
+	c, ok := b.clients[chainID]
+	closed := b.closed
+	b.mu.Unlock()
+	switch {
+	case closed:
+		return nil, mcpserver.NewError(mcpserver.CodeRelayerUnavailable, "the MCP server is stopping")
+	case ok:
+		return c, nil
+	}
+	// Dial off the lock, so a slow chain does not hold up the others.
 	client, err := ethclient.DialContext(ctx, chain.EVM.RPC)
 	if err != nil {
 		// the RPC URL may hold credentials, so it is not echoed to the agent
 		return nil, mcpserver.NewError(mcpserver.CodeChainRPCError, "dial chain %q failed", chainID)
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if c, ok := b.clients[chainID]; ok || b.closed {
+		client.Close()
+		if ok {
+			return c, nil
+		}
+		return nil, mcpserver.NewError(mcpserver.CodeRelayerUnavailable, "the MCP server is stopping")
+	}
+	if b.clients == nil {
+		b.clients = map[string]*ethclient.Client{}
+	}
+	b.clients[chainID] = client
 	return client, nil
 }
 

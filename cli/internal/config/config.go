@@ -91,6 +91,16 @@ type MCPConfig struct {
 	// File holding the bearer token MCP clients must send. Empty uses mcp-token in the IBC home.
 	// A missing file is created with a random token and mode 0600.
 	TokenFile string `yaml:"tokenFile,omitempty"`
+	// IFT tokens MCP clients can discover; sends are not limited to them.
+	Tokens []MCPToken `yaml:"tokens,omitempty"`
+}
+
+// MCPToken is an IFT token MCP lists for agents.
+type MCPToken struct {
+	// ChainID is a declared EVM chain.
+	ChainID string `yaml:"chainId"`
+	// IFT is the token's contract address on that chain.
+	IFT string `yaml:"ift"`
 }
 
 // ServerConfig config for RPC server for both relayer and attestor
@@ -264,6 +274,7 @@ func (c Config) Validate() error {
 		{"attestors", c.Attestors.Validate},
 		{"relayer", c.Relayer.Validate},
 		{"relayer", c.validateAutoRelay},
+		{"mcp.tokens", c.validateMCPTokens},
 		{"", c.crossValidate},
 	} {
 		if err := step.validate(); err != nil {
@@ -271,6 +282,22 @@ func (c Config) Validate() error {
 		}
 	}
 
+	return nil
+}
+
+// validateMCPTokens checks each MCP token names a declared EVM chain and a hex address.
+func (c Config) validateMCPTokens() error {
+	for i, t := range c.MCP.Tokens {
+		chain, ok := c.Chain(t.ChainID)
+		switch {
+		case !ok:
+			return errPathf(fmt.Sprintf("[%d].chainId", i), "chain %q is not declared", t.ChainID)
+		case chain.Type() != ChainTypeEVM:
+			return errPathf(fmt.Sprintf("[%d].chainId", i), "chain %q is not an EVM chain", t.ChainID)
+		case !common.IsHexAddress(t.IFT):
+			return errPathf(fmt.Sprintf("[%d].ift", i), "%q is not a hex address", t.IFT)
+		}
+	}
 	return nil
 }
 

@@ -8,6 +8,14 @@ import (
 	"strings"
 )
 
+// LogModule is the module attribute on every MCP log record, so the relayer's
+// process log can be filtered to MCP lines with module=mcp.
+const LogModule = "mcp"
+
+// Logger returns the relayer logger tagged with module=mcp. It reads the
+// default logger on each call, so it follows the logger set at startup.
+func Logger() *slog.Logger { return slog.Default().With("module", LogModule) }
+
 // processLogWriter turns one standard-log write into relayer log records,
 // one per line, so a recovered panic stack is kept.
 type processLogWriter struct {
@@ -18,7 +26,7 @@ type processLogWriter struct {
 // instead of the standard log package.
 func processErrorLog(logger *slog.Logger) *log.Logger {
 	if logger == nil {
-		logger = slog.Default()
+		logger = Logger()
 	}
 	return log.New(processLogWriter{logger: logger}, "", 0)
 }

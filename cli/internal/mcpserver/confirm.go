@@ -3,14 +3,20 @@
 package mcpserver
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 const (
@@ -179,4 +185,113 @@ func (c *confirmations) mac(nonce, exp string, fields []string) string {
 		h.Write([]byte(f))
 	}
 	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+}
+
+// noElicitationMessage explains why a client without elicitation cannot send.
+const noElicitationMessage = "user confirmation is required but this MCP client does not support elicitation. " +
+	"Tell the user that sends need a client with elicitation; do not retry."
+
+// writeAction is the first approval field and the verb in the prompt.
+const writeAction = "Send"
+
+// askConfirmation builds the approval request; a client without elicitation is refused, not sent unconfirmed.
+func (s *Server) askConfirmation(
+	ctx context.Context, req *mcp.CallToolRequest, w writeRequest, to string, amount *big.Int, fields []string,
+) (*mcp.CallToolResult, error) {
+	if !clientElicits(req) {
+		return nil, NewError(CodePolicyDenied, "%s", noElicitationMessage)
+	}
+
+	shown := amount.String() + " base units"
+	if d := s.displayAmount(ctx, w.chainID, w.ift, amount); d != "" {
+		shown = fmt.Sprintf("%s (%s base units)", d, amount)
+	}
+	msg := fmt.Sprintf(
+		"%s %s of token %s on chain %s from signer %q to %s, over client %s with a %s packet timeout, "+
+			"relay %s. Approve this transaction?",
+		writeAction, shown, w.ift, w.chainID, w.from, to, w.clientID, w.timeout, w.relay)
+
+	return &mcp.CallToolResult{
+		InputRequests: mcp.InputRequestMap{
+			confirmInputKey: &mcp.ElicitParams{
+				Message: msg,
+				RequestedSchema: &jsonschema.Schema{
+					Type: "object",
+					Properties: map[string]*jsonschema.Schema{
+						"approve": {
+							Type:        "boolean",
+							Title:       "Approve",
+							Description: "Sign and broadcast this transaction",
+						},
+					},
+					Required: []string{"approve"},
+				},
+			},
+		},
+		RequestState: s.confirm.issue(fields...),
+	}, nil
+}
+
+// clientElicits reports whether the client can answer the approval request.
+func clientElicits(req *mcp.CallToolRequest) bool {
+	if req == nil {
+		return false
+	}
+	caps := req.ClientCapabilities()
+	return caps != nil && caps.Elicitation != nil
+}
+
+// checkConfirmation verifies the retry carries the user's approval for exactly this write.
+func (s *Server) checkConfirmation(req *mcp.CallToolRequest, fields []string) error {
+	switch s.confirm.redeem(req.Params.RequestState, fields...) {
+	case confirmAccepted:
+	case confirmUsed:
+		return spentApprovalError(s.confirm.spentTx(req.Params.RequestState))
+	case confirmOtherRun:
+		return NewError(CodePolicyDenied,
+			"confirmation was issued before this relayer restarted, so whether it was used is not known; "+
+				"the transfer may already be broadcast. Ask the user before calling ibc_ift_send again.")
+	case confirmStale:
+		return NewError(CodePolicyDenied,
+			"confirmation expired more than %s ago and this server no longer knows whether it was used; "+
+				"the transfer may already be broadcast. Ask the user before calling ibc_ift_send again.",
+			spentRetention)
+	default:
+		// Mismatch and expiry did not spend the token.
+		return NewError(CodePolicyDenied,
+			"confirmation does not match this transaction or has expired; call the tool again")
+	}
+	res, ok := req.Params.InputResponses[confirmInputKey].(*mcp.ElicitResult)
+	if !ok || res == nil {
+		return NewError(CodeUserDeclined, "no confirmation answer was returned; nothing was sent. Retry only if the user asks.")
+	}
+	if res.Action != "accept" {
+		return NewError(CodeUserDeclined, "user did not approve the transaction (%s); nothing was sent. Retry only if the user asks.", res.Action)
+	}
+	if approve, _ := res.Content["approve"].(bool); !approve {
+		return NewError(CodeUserDeclined, "user did not approve the transaction; nothing was sent. Retry only if the user asks.")
+	}
+	return nil
+}
+
+// spentApprovalError reports a replayed approval. Approvals are spent before broadcast,
+// so a hash is present only if that broadcast has since returned one.
+func spentApprovalError(tx *TxRef) *ToolError {
+	if tx == nil || tx.TxHash == "" {
+		return NewError(CodePolicyDenied,
+			"confirmation was already used; the transfer may already be broadcast. No transaction hash was returned. Ask the user. Do not call ibc_ift_send.")
+	}
+	e := NewError(CodePolicyDenied,
+		"confirmation was already used; the transfer may already be broadcast. Call ibc_get_packets with source_tx_hash. Do not call ibc_ift_send.")
+	copied := *tx
+	e.Tx = &copied
+	return e
+}
+
+// noteBroadcast stores a hash on the approval that authorized this send.
+func (s *Server) noteBroadcast(req *mcp.CallToolRequest, tx TxRef) {
+	if req == nil || req.Params == nil {
+		return
+	}
+	s.confirm.noteTx(req.Params.RequestState, tx)
 }

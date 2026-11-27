@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"sync"
 	"time"
@@ -164,7 +163,7 @@ func (s *Server) record(rec auditRecord) error {
 	// operator sees: slog writes stderr, and the image does not redirect it.
 	logAudit(rec)
 	if err := s.audit.write(rec); err != nil {
-		slog.With("module", "mcp").Error("MCP audit log write failed",
+		Logger().Error("MCP audit log write failed",
 			"err", err, "tool", rec.Tool, "outcome", rec.Outcome)
 		return err
 	}
@@ -189,7 +188,7 @@ func logAudit(rec auditRecord) {
 	if rec.TxHash != "" {
 		attrs = append(attrs, "tx", rec.TxHash)
 	}
-	slog.With("module", "mcp").Info("MCP audit", attrs...)
+	Logger().Info("MCP audit", attrs...)
 }
 
 // note records a call that submitted nothing, ignoring a log failure.

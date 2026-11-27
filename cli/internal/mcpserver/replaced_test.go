@@ -30,7 +30,7 @@ func (m *minedRelayer) Relay(_ context.Context, _, txHash string, _ []PacketSele
 	defer m.mu.Unlock()
 	m.relays = append(m.relays, txHash)
 	if !strings.EqualFold(txHash, m.mined) {
-		return nil, NewError(CodeInvalidArgument, "no packets found in tx %s", txHash)
+		return nil, NewError(CodePacketsNotFound, "no packets found in tx %s", txHash)
 	}
 	return []ObservedPacket{{SourceClientID: "base-0", Sequence: "42", Selection: SelectionSelected}}, nil
 }
@@ -121,7 +121,7 @@ func TestReplacedSendIsFollowedByTools(t *testing.T) {
 		WaitInput{ChainID: chainA, TxHash: txHash, TimeoutSeconds: 1})
 	require.NoError(t, err)
 	require.True(t, waited.Done)
-	require.Contains(t, waited.Hint, replacementHash)
+	require.Contains(t, waited.Next.Reason, replacementHash)
 }
 
 func TestReplacedSendWhereOriginalWasMined(t *testing.T) {

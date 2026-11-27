@@ -132,6 +132,21 @@ func TestStartRelayerMCPLogsLifecycle(t *testing.T) {
 	require.Contains(t, logs.String(), `msg="MCP server stopped"`)
 }
 
+func TestEVMBackendSharesRPCClients(t *testing.T) {
+	b := &evmBackend{cfg: config.Config{Chains: config.Chains{
+		{ChainID: "1", EVM: &config.EVMChainConfig{RPC: "http://127.0.0.1:8545"}},
+	}}}
+	first, err := b.dial(t.Context(), "1")
+	require.NoError(t, err)
+	second, err := b.dial(t.Context(), "1")
+	require.NoError(t, err)
+	require.Same(t, first, second, "one client per chain")
+
+	b.Close()
+	_, err = b.dial(t.Context(), "1")
+	require.ErrorContains(t, err, "stopping", "no client outlives Close")
+}
+
 func TestRedactRPC(t *testing.T) {
 	err := &url.Error{Op: "Post", URL: "http://user:secret@rpc.example/v1", Err: errors.New("connection refused")}
 	require.Equal(t, "connection refused", redactRPC(err))

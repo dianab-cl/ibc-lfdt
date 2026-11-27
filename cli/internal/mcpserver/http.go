@@ -56,7 +56,7 @@ func (s *Server) ListenHTTP(addr, token string) (*HTTPServer, error) {
 		return nil, err
 	}
 
-	logger := slog.With("module", "mcp")
+	logger := Logger()
 	handler := requireBearer(token, mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return s.mcp },
 		&mcp.StreamableHTTPOptions{Logger: logger, SessionTimeout: httpSessionTimeout},

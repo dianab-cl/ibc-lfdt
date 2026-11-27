@@ -43,6 +43,8 @@ type SendRequest struct {
 	From           string // signer alias
 	Timeout        time.Duration
 	ConfirmTimeout time.Duration
+	// OnBroadcast, when set, gets the hash as soon as the tx is broadcast.
+	OnBroadcast func(TxRef)
 	// OnReplaced is told of each same-nonce re-sign, even after IFTSend returned.
 	// Only one of the hashes can be mined.
 	OnReplaced func(previous, replacement string)

@@ -121,7 +121,8 @@ past the packet timeout, with a 15m source-finality guard) and can move to confi
 `tool` is one of the registered tools, or `unknown` for any other name. `code` is
 empty when `result` is `ok`. A tool error uses its code: `INVALID_ARGUMENT`,
 `POLICY_DENIED`, `USER_DECLINED`, `CONFIG_ERROR`, `CHAIN_RPC_ERROR`,
-`TX_REVERTED`, `TX_NOT_CONFIRMED`, `RELAYER_UNAVAILABLE`, or `RELAYER_ERROR`.
+`TX_REVERTED`, `TX_NOT_CONFIRMED`, `RELAYER_UNAVAILABLE`, `RELAYER_ERROR`, or
+`PACKETS_NOT_FOUND`.
 Anything else is `other`. Amounts, addresses, transaction hashes, and RPC URLs
 are not label values. A send that needs the user's approval counts differently
 by client protocol. A client on protocol 2026-07-28 or later gets the approval

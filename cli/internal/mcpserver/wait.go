@@ -12,17 +12,15 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// Reasons of the next step after a wait.
 const (
-	waitDoneHint = "Every packet reached the until condition, including ack, timeout, rejection, and relay failure. " +
-		"Read each packet state and summary before telling the user the transfer arrived. " +
-		"succeeded is the delivered state. timed_out, rejected, and relay_failed are finished and failed. " +
-		"Do not call ibc_ift_send again because a packet timed out or the wait timed out."
-	waitNoPacketsHint = "No packets have been seen. Call ibc_relay_tx with this chain_id and tx_hash, " +
-		"then call ibc_wait_for_packets again. Do not call ibc_ift_send again."
-	waitNotSelectedHint = "Some packets are not_selected. Call ibc_relay_tx with this chain_id and tx_hash, " +
-		"then call ibc_wait_for_packets again. Do not call ibc_ift_send again."
-	waitMovingHint = "Packets are already moving. Call ibc_wait_for_packets again. Do not call ibc_ift_send again."
-	// waitCanceledMessage names the next call, since a cancelled wait is not retryable.
+	waitDoneHint        = "Every packet finished. Only succeeded means delivered; timed_out, rejected and relay_failed failed."
+	waitNoPacketsHint   = "No packets seen yet; ask the relayer to deliver them, then wait again."
+	waitNotSelectedHint = "Some packets are not_selected; relay them, then wait again."
+	waitMovingHint      = "Packets are still moving; wait again."
+	waitMiningHint      = "The source tx is not mined yet; wait again."
+	waitBusyHint        = "Too many waits are in progress on this server; wait again."
+	// waitCanceledMessage names the next call, and that it is not ibc_ift_send.
 	waitCanceledMessage = "The wait was cancelled. Call ibc_wait_for_packets again, not ibc_ift_send."
 )
 
@@ -30,8 +28,8 @@ const (
 type WaitInput struct {
 	ChainID        string `json:"chain_id"                  jsonschema:"source chain"`
 	TxHash         string `json:"tx_hash"                   jsonschema:"source tx"`
-	Until          string `json:"until,omitempty"           jsonschema:"final (default): ack, timeout, rejection or relay failure; received: recv tx seen on the destination"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"how long to wait in seconds; default 600, maximum 1800"`
+	Until          string `json:"until,omitempty"           jsonschema:"final (default) or received (recv tx seen)"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"seconds; default 45, maximum 1800"`
 }
 
 // WaitSummary counts packets by state.
@@ -46,12 +44,12 @@ type WaitSummary struct {
 
 // WaitOutput is the result of ibc_wait_for_packets.
 type WaitOutput struct {
-	Done           bool           `json:"done"            jsonschema:"every packet reached the until condition, including ack, timeout, rejection, and relay failure. Read each packet state and summary before telling the user the transfer arrived. succeeded is the delivered state. timed_out, rejected, and relay_failed are finished and failed. Do not call ibc_ift_send again because a packet timed out or the wait timed out"`
-	TimedOut       bool           `json:"timed_out"       jsonschema:"the wait ended before done; this is not an error. If no packets have been seen, call ibc_relay_tx, then call ibc_wait_for_packets again. If packets are already moving, call ibc_wait_for_packets again. A not_selected packet does not wait out this timeout. Do not call ibc_ift_send again"`
+	Done           bool           `json:"done"            jsonschema:"every packet reached until; check each state"`
+	TimedOut       bool           `json:"timed_out"       jsonschema:"timeout_seconds passed first; not an error"`
 	ElapsedSeconds int            `json:"elapsed_seconds"`
 	Summary        WaitSummary    `json:"summary"`
 	Packets        []PacketStatus `json:"packets"`
-	Hint           string         `json:"hint,omitempty"`
+	Next           NextStep       `json:"next"`
 }
 
 // progressNotifier reports packet state changes to clients that sent a
@@ -101,13 +99,29 @@ func (s *Server) waitForPackets(
 	var packets []PacketStatus
 	var lastErr *ToolError
 	used := in.TxHash
-	result := func(done, timedOut bool, hint string) (*mcp.CallToolResult, WaitOutput, error) {
+	mining := false
+	result := func(done, timedOut bool, next NextStep) (*mcp.CallToolResult, WaitOutput, error) {
 		out := waitResult(packets, done, timedOut, start)
-		out.Hint = hint
+		out.Next = next.at(&TxRef{ChainID: in.ChainID, TxHash: used})
 		if note := replacedNote(in.TxHash, used); note != "" {
-			out.Hint = note + " " + hint
+			out.Next.Reason = note + " " + out.Next.Reason
 		}
 		return nil, out, nil
+	}
+
+	// Over the cap, queue for a slot within the same timeout, without polling.
+	select {
+	case s.waitSlots <- struct{}{}:
+		defer func() { <-s.waitSlots }()
+		// Ticks while queued are dropped, so polling starts on its own cadence.
+		ticker.Reset(s.poll)
+	case <-ctx.Done():
+		return nil, WaitOutput{}, waitCancelError(ctx.Err())
+	case <-waitCtx.Done():
+		if ctx.Err() != nil {
+			return nil, WaitOutput{}, waitCancelError(ctx.Err())
+		}
+		return result(false, true, NextStep{Tool: toolWait, Reason: waitBusyHint})
 	}
 
 	for {
@@ -116,12 +130,28 @@ func (s *Server) waitForPackets(
 			packets, used, lastErr = got, gotHash, nil
 			notifier.changes(ctx, seen, packets, until)
 			if len(packets) > 0 && allReached(packets, until) {
-				return result(true, false, waitDoneHint)
+				return result(true, false, NextStep{Reason: waitDoneHint})
 			}
 			// not_selected is not in progress. Return the relay hint now
 			// instead of holding the call until timeout_seconds.
 			if countState(packets, StateNotSelected) > 0 {
-				return result(false, false, waitNotSelectedHint)
+				return result(false, false, NextStep{Tool: toolRelay, Reason: waitNotSelectedHint})
+			}
+			// Without packets, a send of this server says whether waiting can help.
+			if len(packets) == 0 {
+				if rec, ok := s.sends.byHash(s.replaced.family(in.TxHash)); ok {
+					switch {
+					case rec.Status == sendFailed:
+						next := sendNextStep(rec)
+						if next.Tool == "" {
+							return nil, WaitOutput{}, rec.Error
+						}
+						return result(false, false, next)
+					case rec.Status == sendMined && rec.Next.Tool != toolWait:
+						return result(false, false, rec.Next)
+					}
+					mining = rec.Status != sendMined
+				}
 			}
 		}
 
@@ -130,7 +160,7 @@ func (s *Server) waitForPackets(
 		}
 		if waitCtx.Err() != nil {
 			// The wait's own deadline, not a cancellation: a normal timed-out result.
-			return result(false, true, waitTimeoutHint(packets, lastErr))
+			return result(false, true, waitTimeoutNext(packets, lastErr, mining))
 		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -146,21 +176,22 @@ func (s *Server) waitForPackets(
 		case <-ctx.Done():
 			return nil, WaitOutput{}, waitCancelError(ctx.Err())
 		case <-waitCtx.Done():
-			return result(false, true, waitTimeoutHint(packets, lastErr))
+			return result(false, true, waitTimeoutNext(packets, lastErr, mining))
 		case <-ticker.C:
 		}
 	}
 }
 
-// waitCancelError makes a cancelled wait non-retryable, except a CHAIN_RPC_ERROR
-// or RELAYER_UNAVAILABLE that is not itself a context error.
+// waitCancelError reports a cancelled wait as RELAYER_UNAVAILABLE, which is retryable:
+// waiting again is a read. A CHAIN_RPC_ERROR or RELAYER_UNAVAILABLE that is not itself
+// a context error is kept.
 func waitCancelError(err error) *ToolError {
 	var te *ToolError
 	if errors.As(err, &te) && (te.Code == CodeChainRPCError || te.Code == CodeRelayerUnavailable) &&
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		return te
 	}
-	return NewError(CodeRelayerError, "%s", waitCanceledMessage)
+	return NewError(CodeRelayerUnavailable, "%s", waitCanceledMessage)
 }
 
 // txPackets lists a source tx's packets, trying each re-signed hash newest
@@ -217,22 +248,20 @@ func allReached(packets []PacketStatus, until string) bool {
 	return true
 }
 
-// waitTimeoutHint is the next step after a wait that ended without done.
-func waitTimeoutHint(packets []PacketStatus, lastErr *ToolError) string {
+// waitTimeoutNext is the next step when the wait ended before done.
+func waitTimeoutNext(packets []PacketStatus, lastErr *ToolError, mining bool) NextStep {
 	switch {
 	case lastErr != nil:
-		msg := strings.TrimSpace(lastErr.Message)
-		if msg != "" && !strings.HasSuffix(msg, ".") {
-			msg += "."
-		}
-		return "relayer was unreachable at the last poll: " + msg +
-			" Call ibc_wait_for_packets again. Do not call ibc_ift_send again."
+		return NextStep{Tool: toolWait, Reason: "The relayer was unreachable at the last poll: " +
+			strings.TrimSpace(lastErr.Message)}
+	case len(packets) == 0 && mining:
+		return NextStep{Tool: toolWait, Reason: waitMiningHint}
 	case len(packets) == 0:
-		return waitNoPacketsHint
+		return NextStep{Tool: toolRelay, Reason: waitNoPacketsHint}
 	case countState(packets, StateNotSelected) > 0:
-		return waitNotSelectedHint
+		return NextStep{Tool: toolRelay, Reason: waitNotSelectedHint}
 	default:
-		return waitMovingHint
+		return NextStep{Tool: toolWait, Reason: waitMovingHint}
 	}
 }
 

@@ -100,7 +100,7 @@ func knownToolCode(code ErrorCode) bool {
 	switch code {
 	case CodeInvalidArgument, CodePolicyDenied, CodeUserDeclined, CodeConfigError,
 		CodeChainRPCError, CodeTxReverted, CodeTxNotConfirmed,
-		CodeRelayerUnavailable, CodeRelayerError:
+		CodeRelayerUnavailable, CodeRelayerError, CodePacketsNotFound:
 		return true
 	default:
 		return false

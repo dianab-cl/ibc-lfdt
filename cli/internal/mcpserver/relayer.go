@@ -156,15 +156,13 @@ func selectionFromProto(s relayer.PacketSelection) PacketSelection {
 	}
 }
 
-// relayTxError makes only NotFound "no packets found" retryable: a just-mined tx
-// returns it until the node serves the receipt.
+// relayTxError reports NotFound "no packets found" as PACKETS_NOT_FOUND, which is
+// retryable: a just-mined tx returns it until the node serves the receipt.
 func relayTxError(err error) *ToolError {
 	var ce *connect.Error
 	if errors.As(err, &ce) && ce.Code() == connect.CodeNotFound &&
 		strings.Contains(ce.Message(), "no packets found") {
-		te := NewError(CodeInvalidArgument, "relayer: %s. Retry ibc_relay_tx", ce.Message())
-		te.Retryable = true
-		return te
+		return NewError(CodePacketsNotFound, "relayer: %s. Retry ibc_relay_tx", ce.Message())
 	}
 	return relayerError(err)
 }

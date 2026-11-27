@@ -5,6 +5,7 @@ package mcpserver
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -260,4 +261,48 @@ func TestStopEndsUnansweredApprovalPrompt(t *testing.T) {
 		t.Fatal("Stop blocked on an unanswered approval prompt")
 	}
 	require.Zero(t, chain.sendCount(), "nothing is sent without an answer")
+}
+
+// Every record the MCP server writes to the process log carries module=mcp, so
+// an operator can tell MCP lines from the relayer's own.
+func TestProcessLogLinesCarryModule(t *testing.T) {
+	var logs syncBuffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	audit, err := OpenAuditLog(t.TempDir() + "/audit.jsonl")
+	require.NoError(t, err)
+	srv, err := New(&fakeChain{}, &fakeRelayer{}, Options{Audit: audit, PollInterval: 10 * time.Millisecond})
+	require.NoError(t, err)
+	srv.skipConfirmation = true
+	h, err := srv.ListenHTTP("127.0.0.1:0", testToken)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil).
+		Connect(ctx, &mcp.StreamableClientTransport{HTTPClient: bearerClient(testToken), Endpoint: h.URL()}, nil)
+	require.NoError(t, err)
+	_, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "ibc_ift_send", Arguments: map[string]any{
+		"chain_id": chainA, "ift": tokenA, "client_id": "base-0", "to": bobHex, "amount": "100",
+	}})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return listSends(t, srv)[0].Status == sendMined },
+		time.Second, 10*time.Millisecond)
+	require.NoError(t, cs.Close())
+	require.NoError(t, h.Stop())
+	require.NoError(t, srv.Close())
+
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	require.NotEmpty(t, lines)
+	audits := 0
+	for _, line := range lines {
+		var rec map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &rec), line)
+		require.Equal(t, LogModule, rec["module"], line)
+		if rec["msg"] == "MCP audit" {
+			audits++
+		}
+	}
+	require.GreaterOrEqual(t, audits, 2, "the send's intent and outcome lines")
 }

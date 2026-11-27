@@ -19,6 +19,9 @@ const (
 	CodeTxNotConfirmed     ErrorCode = "TX_NOT_CONFIRMED"
 	CodeRelayerUnavailable ErrorCode = "RELAYER_UNAVAILABLE"
 	CodeRelayerError       ErrorCode = "RELAYER_ERROR"
+	// CodePacketsNotFound is a relay that found no packets in the tx yet, for
+	// example before the node serves a just-mined receipt.
+	CodePacketsNotFound ErrorCode = "PACKETS_NOT_FOUND"
 )
 
 // ErrorCode is a stable, machine-readable failure class for agents to branch on.
@@ -54,7 +57,7 @@ func NewTxError(code ErrorCode, tx TxRef, format string, args ...any) *ToolError
 
 func retryable(code ErrorCode) bool {
 	switch code {
-	case CodeChainRPCError, CodeRelayerUnavailable:
+	case CodeChainRPCError, CodeRelayerUnavailable, CodePacketsNotFound:
 		return true
 	default:
 		// TX_NOT_CONFIRMED is not retryable: the tx may still mine, and signing

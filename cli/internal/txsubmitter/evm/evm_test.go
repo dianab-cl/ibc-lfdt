@@ -358,7 +358,7 @@ func TestRestartRecoversUnknownGap(t *testing.T) {
 func TestConfirmKeepsHashWhenBroadcastMayHaveLanded(t *testing.T) {
 	c, rpc := newSubmitter(t)
 	rpc.send = func(*types.Transaction) error { return context.DeadlineExceeded }
-	hash, receipt, err := c.Confirm(t.Context(), testIntent(), 300*time.Millisecond, nil)
+	hash, receipt, err := c.Confirm(t.Context(), testIntent(), 300*time.Millisecond, nil, nil)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Nil(t, receipt)
 	require.Equal(t, rpc.sent[0].Hash().Hex(), hash)
@@ -366,17 +366,38 @@ func TestConfirmKeepsHashWhenBroadcastMayHaveLanded(t *testing.T) {
 
 	rpc.send = nil
 	rpc.receipt = &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: common.HexToHash(hash)}
-	next, _, err := c.Confirm(t.Context(), testIntent(), time.Second, nil)
+	next, _, err := c.Confirm(t.Context(), testIntent(), time.Second, nil, nil)
 	require.NoError(t, err)
 	require.NotEqual(t, hash, next)
 	require.Equal(t, uint64(1), rpc.sent[1].Nonce())
+}
+
+func TestConfirmReportsBroadcastBeforeMining(t *testing.T) {
+	c, rpc := newSubmitter(t)
+	var broadcast []string
+	onBroadcast := func(hash string) {
+		require.Nil(t, rpc.receipt, "reported before the receipt")
+		broadcast = append(broadcast, hash)
+		rpc.receipt = &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: common.HexToHash(hash)}
+	}
+	hash, receipt, err := c.Confirm(t.Context(), testIntent(), time.Second, onBroadcast, nil)
+	require.NoError(t, err)
+	require.NotNil(t, receipt)
+	require.Equal(t, []string{hash}, broadcast)
+
+	rejected := errors.New("transaction pool full")
+	rpc.send = func(*types.Transaction) error { return rejected }
+	broadcast = nil
+	_, _, err = c.Confirm(t.Context(), testIntent(), time.Second, onBroadcast, nil)
+	require.ErrorIs(t, err, rejected)
+	require.Empty(t, broadcast, "a rejected broadcast is not reported")
 }
 
 func TestConfirmRejectedBroadcastDoesNotReserveNonce(t *testing.T) {
 	c, rpc := newSubmitter(t)
 	rejected := errors.New("transaction pool full")
 	rpc.send = func(*types.Transaction) error { return rejected }
-	hash, receipt, err := c.Confirm(t.Context(), testIntent(), time.Second, nil)
+	hash, receipt, err := c.Confirm(t.Context(), testIntent(), time.Second, nil, nil)
 	require.ErrorIs(t, err, rejected)
 	require.Empty(t, hash)
 	require.Nil(t, receipt)
@@ -480,7 +501,7 @@ func TestConfirmClassifiesBroadcastFailures(t *testing.T) {
 			if tt.keepHash {
 				timeout = 30 * time.Millisecond
 			}
-			hash, receipt, err := c.Confirm(t.Context(), testIntent(), timeout, nil)
+			hash, receipt, err := c.Confirm(t.Context(), testIntent(), timeout, nil, nil)
 			require.Error(t, err)
 			require.Nil(t, receipt)
 			if !tt.keepHash {
@@ -595,7 +616,7 @@ func TestSubmitReplacesStalledConfirmTransfer(t *testing.T) {
 			if tt.send != nil {
 				rpc.send = func(tx *types.Transaction) error { return tt.send(rpc, tx) }
 			}
-			hash, receipt, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil)
+			hash, receipt, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil, nil)
 			require.Error(t, err)
 			require.Nil(t, receipt)
 			require.Equal(t, rpc.sent[0].Hash().Hex(), hash)
@@ -641,7 +662,7 @@ func TestSubmitReplacesStalledConfirmTransfer(t *testing.T) {
 func TestConfirmReportsMinedReplacement(t *testing.T) {
 	c, rpc := newSubmitter(t)
 	replaced := make(chan [2]string, 1)
-	first, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, func(previous, replacement string) {
+	first, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil, func(previous, replacement string) {
 		replaced <- [2]string{previous, replacement}
 	})
 	require.Error(t, err)
@@ -701,7 +722,7 @@ func TestConfirmReportsMinedReplacement(t *testing.T) {
 
 func TestFailedStallReplacementRestartsTimer(t *testing.T) {
 	c, rpc := newSubmitter(t)
-	_, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil)
+	_, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil, nil)
 	require.Error(t, err)
 
 	expireNonce(c)
@@ -723,7 +744,7 @@ func TestFailedStallReplacementRestartsTimer(t *testing.T) {
 
 func TestRevertingStallReplacementFreesNonce(t *testing.T) {
 	c, rpc := newSubmitter(t)
-	_, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil)
+	_, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil, nil)
 	require.Error(t, err)
 	require.Equal(t, uint64(1), rpc.pending)
 
@@ -1035,7 +1056,7 @@ func TestEstimationRevertClassification(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c, rpc := newSubmitter(t)
 			rpc.gasErr = tt.err
-			hash, _, err := c.Confirm(t.Context(), testIntent(), 0, nil)
+			hash, _, err := c.Confirm(t.Context(), testIntent(), 0, nil, nil)
 			require.Empty(t, hash)
 			require.ErrorIs(t, err, tt.err)
 			require.Equal(t, tt.reverted, errors.Is(err, ErrEstimationReverted))
@@ -1085,7 +1106,7 @@ func TestConfirmCountsGasWhenReservationDroppedDuringWait(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		hash, receipt, err := c.Confirm(t.Context(), testIntent(), 10*time.Second, nil)
+		hash, receipt, err := c.Confirm(t.Context(), testIntent(), 10*time.Second, nil, nil)
 		done <- result{hash, receipt, err}
 	}()
 	<-polled // Confirm broadcast and is waiting for the receipt.
@@ -1131,7 +1152,7 @@ func TestConfirmCountsGasWhenOriginalMinesAfterReplacement(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		hash, _, err := c.Confirm(t.Context(), testIntent(), 10*time.Second, nil)
+		hash, _, err := c.Confirm(t.Context(), testIntent(), 10*time.Second, nil, nil)
 		done <- result{hash, err}
 	}()
 	<-polled // Confirm broadcast and is waiting for the receipt.
@@ -1161,7 +1182,7 @@ func TestReplacementsReportedInSigningOrder(t *testing.T) {
 	release := make(chan struct{})
 	got := make(chan [2]string, 2)
 	var calls atomic.Int32
-	first, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, func(previous, replacement string) {
+	first, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil, func(previous, replacement string) {
 		// Hold the first report until the second replacement is signed.
 		if calls.Add(1) == 1 {
 			<-release
@@ -1219,7 +1240,7 @@ func TestConfirmCancelledBeforeBroadcastDoesNotReserveNonce(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	c.signer = cancellingSigner{Signer: c.signer, cancel: cancel}
-	hash, receipt, err := c.Confirm(ctx, testIntent(), time.Second, nil)
+	hash, receipt, err := c.Confirm(ctx, testIntent(), time.Second, nil, nil)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Empty(t, hash, "nothing was sent, so there is no hash to report")
 	require.Nil(t, receipt)
@@ -1258,7 +1279,7 @@ func TestStallReplacementOutbidsTransferAfterLowerNoncesMine(t *testing.T) {
 	c, rpc := newSubmitter(t)
 	require.NoError(t, submit(t, c))
 	require.NoError(t, submit(t, c))
-	hash, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil)
+	hash, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil, nil)
 	require.Error(t, err)
 	original := rpc.sent[2]
 	require.Equal(t, uint64(2), original.Nonce())
@@ -1290,7 +1311,7 @@ func TestIdenticalStallReplacementIsNotReported(t *testing.T) {
 	// No base fee: fee cap equals tip, 8 wei.
 	rpc.baseFee, rpc.tip = 0, 8
 	var replaced atomic.Int32
-	hash, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, func(string, string) {
+	hash, _, err := c.Confirm(t.Context(), testIntent(), 30*time.Millisecond, nil, func(string, string) {
 		replaced.Add(1)
 	})
 	require.Error(t, err)

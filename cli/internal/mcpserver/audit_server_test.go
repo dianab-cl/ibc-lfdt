@@ -26,7 +26,7 @@ func TestSendAuditRecordsOutcome(t *testing.T) {
 
 	_, out, err := srv.iftSend(context.Background(), &mcp.CallToolRequest{}, sendInput("100"))
 	require.NoError(t, err)
-	require.Equal(t, statusMined, out.Status)
+	require.Equal(t, sendMined, out.Status)
 	require.Equal(t, 1, chain.sendCount())
 
 	recs := readAudit(t, path)
@@ -109,11 +109,12 @@ func TestSendAuditFinalFailureKeepsMinedTx(t *testing.T) {
 
 	_, out, err := srv.iftSend(context.Background(), &mcp.CallToolRequest{}, sendInput("10"))
 	require.NoError(t, err)
-	require.Equal(t, statusMined, out.Status)
+	require.Equal(t, sendMined, out.Status)
 	require.Equal(t, txHash, out.Tx.TxHash)
 	require.Equal(t, 1, chain.sendCount())
 	require.Contains(t, out.Warnings[0], "audit log update failed")
-	require.Equal(t, "Call ibc_wait_for_packets with this chain_id and tx_hash to follow delivery.", out.Next)
+	require.Equal(t, toolWait, out.Next.Tool)
+	require.Equal(t, nextWait, out.Next.Reason)
 	require.Len(t, script.records(), 1)
 	require.Equal(t, outcomeIntent, script.records()[0].Outcome)
 }

@@ -28,8 +28,8 @@ var PacketStates = []PacketState{
 
 // TxRef identifies a transaction on a chain.
 type TxRef struct {
-	ChainID string `json:"chain_id" jsonschema:"EVM chain ID"`
-	TxHash  string `json:"tx_hash"  jsonschema:"transaction hash, 0x-prefixed"`
+	ChainID string `json:"chain_id"`
+	TxHash  string `json:"tx_hash"`
 }
 
 // PacketState is the relay state of a packet, as reported by the relayer.
@@ -39,13 +39,13 @@ type PacketState string
 // A packet is identified by send_tx.chain_id, source_client_id and sequence.
 type PacketStatus struct {
 	SourceClientID string      `json:"source_client_id"`
-	Sequence       string      `json:"sequence"             jsonschema:"packet sequence number, as a decimal string"`
+	Sequence       string      `json:"sequence"             jsonschema:"decimal string"`
 	State          PacketState `json:"state"`
-	Final          bool        `json:"final"                jsonschema:"true when the packet will not change state again"`
-	SendTx         *TxRef      `json:"send_tx,omitempty"    jsonschema:"source-chain SendPacket transaction"`
-	RecvTx         *TxRef      `json:"recv_tx,omitempty"    jsonschema:"destination-chain receive transaction"`
-	AckTx          *TxRef      `json:"ack_tx,omitempty"     jsonschema:"source-chain acknowledgement transaction"`
-	TimeoutTx      *TxRef      `json:"timeout_tx,omitempty" jsonschema:"source-chain timeout transaction"`
+	Final          bool        `json:"final"                jsonschema:"no further state change"`
+	SendTx         *TxRef      `json:"send_tx,omitempty"   `
+	RecvTx         *TxRef      `json:"recv_tx,omitempty"   `
+	AckTx          *TxRef      `json:"ack_tx,omitempty"    `
+	TimeoutTx      *TxRef      `json:"timeout_tx,omitempty"`
 }
 
 // PacketSelection says whether a relayer will deliver a packet it was asked about.
@@ -55,13 +55,13 @@ type PacketSelection string
 type ObservedPacket struct {
 	SourceClientID string          `json:"source_client_id"`
 	Sequence       string          `json:"sequence"`
-	Selection      PacketSelection `json:"selection"        jsonschema:"selected: queued for delivery; not_selected: routed but not picked; unconfigured: this relayer has no route for it"`
+	Selection      PacketSelection `json:"selection"        jsonschema:"selected: queued; not_selected: not queued by this request; unconfigured: no route here"`
 }
 
 // PacketSelector picks one packet of a transaction.
 type PacketSelector struct {
 	SourceClientID string `json:"source_client_id"`
-	Sequence       string `json:"sequence"         jsonschema:"packet sequence number, as a decimal string"`
+	Sequence       string `json:"sequence"         jsonschema:"decimal string"`
 }
 
 // PacketFilter narrows a packet listing; empty fields match everything.
@@ -93,7 +93,7 @@ type ClientEndInfo struct {
 	ChainID   string `json:"chain_id"`
 	ClientID  string `json:"client_id"`
 	Signer    string `json:"signer"     jsonschema:"signer alias this relayer uses for this client"`
-	AutoRelay bool   `json:"auto_relay" jsonschema:"true when the relayer picks up packets from this end without a relay request"`
+	AutoRelay bool   `json:"auto_relay" jsonschema:"the relayer delivers this end's packets without a relay request"`
 }
 
 // ConnectionInfo is a relayed connection between two light clients.
@@ -113,6 +113,19 @@ type SignerInfo struct {
 type TokenInfo struct {
 	Symbol   string `json:"symbol"`
 	Decimals uint8  `json:"decimals"`
+}
+
+// TokenRef is an IFT token listed in mcp.tokens.
+type TokenRef struct {
+	ChainID string
+	IFT     string
+}
+
+// NextStep is the call the agent should make next.
+type NextStep struct {
+	Tool      string            `json:"tool,omitempty"      jsonschema:"tool to call next; empty when no call is left"`
+	Arguments map[string]string `json:"arguments,omitempty" jsonschema:"arguments for that tool"`
+	Reason    string            `json:"reason"`
 }
 
 // Final reports whether no further state change is expected.
